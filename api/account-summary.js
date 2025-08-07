@@ -1,64 +1,65 @@
 import crypto from "crypto";
 
 export default async function handler(req, res) {
-  const apiKey = process.env.BINANCE_API_KEY;
-  const secretKey = process.env.BINANCE_SECRET_KEY;
-
-  if (!apiKey || !secretKey) {
-    return res.status(500).json({ error: "Missing Binance API credentials" });
-  }
-
-  const timestamp = Date.now();
-  const query = `timestamp=${timestamp}`;
-  const signature = crypto
-    .createHmac("sha256", secretKey)
-    .update(query)
-    .digest("hex");
-
-  const url = `https://api.binance.com/sapi/v1/asset/wallet/balance?${query}&signature=${signature}`;
-
   try {
-    const response = await fetch(url, {
-      headers: {
-        "X-MBX-APIKEY": apiKey,
-      },
-    });
+    const apiKey = process.env.BINANCE_API_KEY;
+    const secretKey = process.env.BINANCE_SECRET_KEY;
 
-    const text = await response.text();
-
-    let balances;
-    try {
-      balances = JSON.parse(text);
-    } catch (err) {
-      return res.status(500).json({
-        error: "Binance returned non-JSON response",
-        raw: text,
-      });
+    if (!apiKey || !secretKey) {
+      return res.status(500).json({ error: "Missing API credentials" });
     }
 
-    if (!Array.isArray(balances)) {
-      return res.status(500).json({
-        error: "Unexpected Binance response format",
-        raw: balances,
-      });
-    }
+    const timestamp = Date.now();
+    const query = `timestamp=${timestamp}`;
 
-    // 총 USD 잔고 계산
-    const totalUSD = balances.reduce((sum, wallet) => {
-      if (wallet.activate && wallet.balance) {
-        return sum + parseFloat(wallet.balance);
+    // 서명 함수
+    const sign = (query) =>
+      crypto.createHmac("sha256", secretKey).update(query).digest("hex");
+
+    // 1. BTC 가격 조회 (BTC → USD 변환용)
+    const priceRes = await fetch(
+      "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+    );
+    const priceData = await priceRes.json();
+    const btcPrice = parseFloat(priceData.price);
+
+    // 2. 전체 지갑 BTC 기준 잔액 조회
+    const sig = sign(query);
+    const balanceRes = await fetch(
+      `https://api.binance.com/sapi/v1/asset/wallet/balance?${query}&signature=${sig}`,
+      {
+        headers: { "X-MBX-APIKEY": apiKey },
       }
-      return sum;
-    }, 0);
+    );
 
-    res.status(200).json({
-      totalUSD: parseFloat(totalUSD.toFixed(2)),
-      breakdown: balances
-        .filter((wallet) => parseFloat(wallet.balance) > 0)
-        .map((wallet) => ({
+    const balanceData = await balanceRes.json();
+
+    if (!Array.isArray(balanceData)) {
+      return res.status(500).json({
+        error: "Unexpected response format",
+        debug: JSON.stringify(balanceData),
+      });
+    }
+
+    let totalBTC = 0;
+    const breakdown = [];
+
+    balanceData.forEach((wallet) => {
+      const btcVal = parseFloat(wallet.balance);
+      if (btcVal > 0) {
+        totalBTC += btcVal;
+        breakdown.push({
           wallet: wallet.walletName,
           balance: wallet.balance,
-        })),
+        });
+      }
+    });
+
+    const totalUSD = parseFloat((totalBTC * btcPrice).toFixed(2));
+
+    res.status(200).json({
+      totalUSD,
+      breakdown,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
