@@ -8,52 +8,59 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "Missing Binance API credentials" });
   }
 
-  const sign = (query) =>
-    crypto.createHmac("sha256", secretKey).update(query).digest("hex");
-
   const timestamp = Date.now();
-  const baseUrl = "https://api.binance.com";
+  const query = `timestamp=${timestamp}`;
+  const signature = crypto
+    .createHmac("sha256", secretKey)
+    .update(query)
+    .digest("hex");
 
-  const getSnapshot = async (type) => {
-    const query = `type=${type}&timestamp=${timestamp}`;
-    const signature = sign(query);
-    const url = `${baseUrl}/sapi/v1/accountSnapshot?${query}&signature=${signature}`;
-
-    const resp = await fetch(url, {
-      headers: { "X-MBX-APIKEY": apiKey },
-    });
-
-    const text = await resp.text();
-    try {
-      const data = JSON.parse(text);
-      const balances = data?.snapshotVos?.[0]?.data?.totalAssetOfBtc;
-      return parseFloat(balances) || 0;
-    } catch {
-      console.error("Failed to parse snapshot", { type, text });
-      return 0;
-    }
-  };
+  const url = `https://api.binance.com/sapi/v1/asset/wallet/balance?${query}&signature=${signature}`;
 
   try {
-    const spot = await getSnapshot("SPOT");
-    const margin = await getSnapshot("MARGIN");
-    const futures = await getSnapshot("FUTURES");
+    const response = await fetch(url, {
+      headers: {
+        "X-MBX-APIKEY": apiKey,
+      },
+    });
 
-    // Binance는 자산을 BTC 기준으로 줌 → USD 환산 필요
-    // 가장 간단히 BTCUSDT 시세 사용
-    const tickerRes = await fetch(`${baseUrl}/api/v3/ticker/price?symbol=BTCUSDT`);
-    const ticker = await tickerRes.json();
-    const btcPrice = parseFloat(ticker.price);
+    const text = await response.text();
 
-    const totalUSD = (spot + margin + futures) * btcPrice;
+    let balances;
+    try {
+      balances = JSON.parse(text);
+    } catch (err) {
+      return res.status(500).json({
+        error: "Binance returned non-JSON response",
+        raw: text,
+      });
+    }
+
+    if (!Array.isArray(balances)) {
+      return res.status(500).json({
+        error: "Unexpected Binance response format",
+        raw: balances,
+      });
+    }
+
+    // 총 USD 잔고 계산
+    const totalUSD = balances.reduce((sum, wallet) => {
+      if (wallet.activate && wallet.balance) {
+        return sum + parseFloat(wallet.balance);
+      }
+      return sum;
+    }, 0);
 
     res.status(200).json({
-      spotBTC: spot,
-      marginBTC: margin,
-      futuresBTC: futures,
       totalUSD: parseFloat(totalUSD.toFixed(2)),
+      breakdown: balances
+        .filter((wallet) => parseFloat(wallet.balance) > 0)
+        .map((wallet) => ({
+          wallet: wallet.walletName,
+          balance: wallet.balance,
+        })),
     });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 }
