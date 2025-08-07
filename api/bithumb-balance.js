@@ -13,7 +13,7 @@ export default async function handler(req, res) {
     const url = `https://api.bithumb.com${endpoint}`;
     const nonce = Date.now().toString();
 
-    const body = `endpoint=${endpoint}&currency=KRW`;
+    const body = `endpoint=${endpoint}&currency=ALL`;
 
     const hmac = crypto.createHmac("sha512", apiSecret);
     const signature = hmac.update(Buffer.from(body)).digest("hex");
@@ -37,10 +37,10 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Bithumb API Error", data });
     }
 
-    const totalKRW = parseFloat(data.data.total_krw);
+    const krwBalance = parseFloat(data.data.total_krw || "0");
 
     return res.status(200).json({
-      totalKRW,
+      totalKRW: krwBalance,
     });
   } catch (error) {
     return res.status(500).json({ error: error.message });
