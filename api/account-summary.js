@@ -9,70 +9,39 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing API credentials" });
     }
 
-    // 서명 생성 함수
-    const sign = (query) =>
-      crypto.createHmac("sha256", secretKey).update(query).digest("hex");
-
     const timestamp = Date.now();
     const query = `timestamp=${timestamp}`;
 
-    // 1. 포트폴리오 마진 / Unified Account 전체 USD 가치
-    const sigPM = sign(query);
-    const pmRes = await fetch(
-      `https://fapi.binance.com/vapi/v1/account?${query}&signature=${sigPM}`,
-      { headers: { "X-MBX-APIKEY": apiKey } }
-    );
+    const signature = crypto
+      .createHmac("sha256", secretKey)
+      .update(query)
+      .digest("hex");
 
-    const pmText = await pmRes.text();
-    let pmData;
+    const url = `https://api.binance.com/sapi/v1/portfolio/account?${query}&signature=${signature}`;
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "X-MBX-APIKEY": apiKey,
+      },
+    });
+
+    const text = await response.text();
+    let data;
     try {
-      pmData = JSON.parse(pmText);
+      data = JSON.parse(text);
     } catch (e) {
-      return res.status(500).json({ error: "Binance returned non-JSON response", raw: pmText });
-    }
-
-    if (!pmData.totalWalletBalance) {
-      return res.status(400).json({
-        error: "Failed to fetch total USD value",
-        response: pmData
+      return res.status(500).json({
+        error: "Binance returned non-JSON response",
+        raw: text,
       });
     }
 
-    const totalUSD = parseFloat(pmData.totalWalletBalance);
-
-    // 2. Futures 알트코인 가치 (BTC, ETH, XRP 제외)
-    const sigFutures = sign(query);
-    const futuresRes = await fetch(
-      `https://fapi.binance.com/fapi/v2/positionRisk?${query}&signature=${sigFutures}`,
-      { headers: { "X-MBX-APIKEY": apiKey } }
-    );
-
-    const futuresText = await futuresRes.text();
-    let futuresData;
-    try {
-      futuresData = JSON.parse(futuresText);
-    } catch (e) {
-      return res.status(500).json({ error: "Binance returned non-JSON response", raw: futuresText });
-    }
-
-    let altFuturesUSD = 0;
-    futuresData.forEach((pos) => {
-      if (parseFloat(pos.positionAmt) !== 0) {
-        const symbol = pos.symbol;
-        if (
-          !symbol.startsWith("BTC") &&
-          !symbol.startsWith("ETH") &&
-          !symbol.startsWith("XRP")
-        ) {
-          altFuturesUSD +=
-            Math.abs(parseFloat(pos.positionAmt) * parseFloat(pos.markPrice));
-        }
-      }
-    });
+    const totalUSD = parseFloat(data.totalNetAssetOfBtc) * parseFloat(data.markPriceBtc || 0);
 
     res.status(200).json({
-      totalUSD: parseFloat(totalUSD.toFixed(2)),
-      altFuturesUSD: parseFloat(altFuturesUSD.toFixed(2)),
+      totalNetAssetOfBtc: data.totalNetAssetOfBtc,
+      totalUSD: totalUSD.toFixed(2),
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
