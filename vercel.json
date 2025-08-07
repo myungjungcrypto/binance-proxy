@@ -3,8 +3,7 @@
   "regions": ["sin1"],
   "functions": {
     "api/**/*.js": {
-      "runtime": "@vercel/node@2.15.10",
-      "regions": ["sin1"]
+      "runtime": "@vercel/node@2.15.10"
     }
   }
 }
