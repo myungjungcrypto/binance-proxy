@@ -1,39 +1,59 @@
 import crypto from "crypto";
 
 export default async function handler(req, res) {
-  try {
-    const apiKey = process.env.BINANCE_API_KEY;
-    const secretKey = process.env.BINANCE_SECRET_KEY;
+  const apiKey = process.env.BINANCE_API_KEY;
+  const secretKey = process.env.BINANCE_SECRET_KEY;
 
-    if (!apiKey || !secretKey) {
-      return res.status(500).json({ error: "Missing API credentials" });
-    }
+  if (!apiKey || !secretKey) {
+    return res.status(500).json({ error: "Missing Binance API credentials" });
+  }
 
-    const timestamp = Date.now();
-    const query = `timestamp=${timestamp}`;
+  const sign = (query) =>
+    crypto.createHmac("sha256", secretKey).update(query).digest("hex");
 
-    const sign = (query) =>
-      crypto.createHmac("sha256", secretKey).update(query).digest("hex");
+  const timestamp = Date.now();
+  const baseUrl = "https://api.binance.com";
 
+  const getSnapshot = async (type) => {
+    const query = `type=${type}&timestamp=${timestamp}`;
     const signature = sign(query);
+    const url = `${baseUrl}/sapi/v1/accountSnapshot?${query}&signature=${signature}`;
 
-    const response = await fetch(
-      `https://api.binance.com/sapi/v1/portfolio/account?${query}&signature=${signature}`,
-      {
-        headers: {
-          "X-MBX-APIKEY": apiKey,
-        },
-      }
-    );
-
-    const rawText = await response.text();
-
-    // 디버깅용 응답 출력
-    return res.status(200).json({
-      debug: rawText,
+    const resp = await fetch(url, {
+      headers: { "X-MBX-APIKEY": apiKey },
     });
 
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    const text = await resp.text();
+    try {
+      const data = JSON.parse(text);
+      const balances = data?.snapshotVos?.[0]?.data?.totalAssetOfBtc;
+      return parseFloat(balances) || 0;
+    } catch {
+      console.error("Failed to parse snapshot", { type, text });
+      return 0;
+    }
+  };
+
+  try {
+    const spot = await getSnapshot("SPOT");
+    const margin = await getSnapshot("MARGIN");
+    const futures = await getSnapshot("FUTURES");
+
+    // Binance는 자산을 BTC 기준으로 줌 → USD 환산 필요
+    // 가장 간단히 BTCUSDT 시세 사용
+    const tickerRes = await fetch(`${baseUrl}/api/v3/ticker/price?symbol=BTCUSDT`);
+    const ticker = await tickerRes.json();
+    const btcPrice = parseFloat(ticker.price);
+
+    const totalUSD = (spot + margin + futures) * btcPrice;
+
+    res.status(200).json({
+      spotBTC: spot,
+      marginBTC: margin,
+      futuresBTC: futures,
+      totalUSD: parseFloat(totalUSD.toFixed(2)),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 }
