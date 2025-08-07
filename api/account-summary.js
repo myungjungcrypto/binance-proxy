@@ -22,7 +22,14 @@ export default async function handler(req, res) {
       `https://fapi.binance.com/vapi/v1/account?${query}&signature=${sigPM}`,
       { headers: { "X-MBX-APIKEY": apiKey } }
     );
-    const pmData = await pmRes.json();
+
+    const pmText = await pmRes.text();
+    let pmData;
+    try {
+      pmData = JSON.parse(pmText);
+    } catch (e) {
+      return res.status(500).json({ error: "Binance returned non-JSON response", raw: pmText });
+    }
 
     if (!pmData.totalWalletBalance) {
       return res.status(400).json({
@@ -39,7 +46,14 @@ export default async function handler(req, res) {
       `https://fapi.binance.com/fapi/v2/positionRisk?${query}&signature=${sigFutures}`,
       { headers: { "X-MBX-APIKEY": apiKey } }
     );
-    const futuresData = await futuresRes.json();
+
+    const futuresText = await futuresRes.text();
+    let futuresData;
+    try {
+      futuresData = JSON.parse(futuresText);
+    } catch (e) {
+      return res.status(500).json({ error: "Binance returned non-JSON response", raw: futuresText });
+    }
 
     let altFuturesUSD = 0;
     futuresData.forEach((pos) => {
