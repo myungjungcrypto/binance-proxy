@@ -16,25 +16,31 @@ export default async function handler(req, res) {
     const timestamp = Date.now();
     const query = `timestamp=${timestamp}`;
 
-    // 1. 전체 지갑 USD 가치
-    const sig1 = sign(query);
-    const assetsRes = await fetch(
-      `https://api.binance.com/sapi/v3/asset/getUserAsset?${query}&signature=${sig1}`,
+    // 1. 포트폴리오 마진 / Unified Account 전체 USD 가치
+    const sigPM = sign(query);
+    const pmRes = await fetch(
+      `https://fapi.binance.com/vapi/v1/account?${query}&signature=${sigPM}`,
       { headers: { "X-MBX-APIKEY": apiKey } }
     );
-    const assets = await assetsRes.json();
-    let totalUSD = 0;
-    assets.forEach((a) => {
-      totalUSD += parseFloat(a.usdValue);
-    });
+    const pmData = await pmRes.json();
+
+    if (!pmData.totalWalletBalance) {
+      return res.status(400).json({
+        error: "Failed to fetch total USD value",
+        response: pmData
+      });
+    }
+
+    const totalUSD = parseFloat(pmData.totalWalletBalance);
 
     // 2. Futures 알트코인 가치 (BTC, ETH, XRP 제외)
-    const sig2 = sign(query);
+    const sigFutures = sign(query);
     const futuresRes = await fetch(
-      `https://fapi.binance.com/fapi/v2/positionRisk?${query}&signature=${sig2}`,
+      `https://fapi.binance.com/fapi/v2/positionRisk?${query}&signature=${sigFutures}`,
       { headers: { "X-MBX-APIKEY": apiKey } }
     );
     const futuresData = await futuresRes.json();
+
     let altFuturesUSD = 0;
     futuresData.forEach((pos) => {
       if (parseFloat(pos.positionAmt) !== 0) {
