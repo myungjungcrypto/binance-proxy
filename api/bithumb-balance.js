@@ -11,17 +11,14 @@ export default async function handler(req, res) {
 
     const endpoint = "/info/balance";
     const url = `https://api.bithumb.com${endpoint}`;
-    const currency = "BTC"; // 최소 하나 지정해야 함
-
     const nonce = Date.now().toString();
-    const params = { currency };
-    const encodedParams = new URLSearchParams(params).toString();
-    const strToSign = `${endpoint}\0${encodedParams}\0${nonce}`;
+    const params = new URLSearchParams({ currency: "KRW" }).toString();
 
+    const strToSign = `${endpoint}\0${params}\0${nonce}`;
     const signature = crypto
       .createHmac("sha512", secretKey)
       .update(strToSign)
-      .digest("hex");
+      .digest("base64");
 
     const headers = {
       "Api-Key": apiKey,
@@ -33,28 +30,18 @@ export default async function handler(req, res) {
     const response = await fetch(url, {
       method: "POST",
       headers,
-      body: new URLSearchParams(params),
+      body: params,
     });
 
-    const text = await response.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      return res.status(500).json({ error: "Non-JSON response from Bithumb", raw: text });
+    const result = await response.json();
+
+    if (result.status !== "0000") {
+      return res.status(500).json({ error: "Bithumb API Error", data: result });
     }
 
-    if (data.status !== "0000") {
-      return res.status(400).json({ error: "Bithumb API Error", data });
-    }
-
-    const krwBalance = parseFloat(data.data.total_krw) || 0;
-
-    return res.status(200).json({
-      krwBalance,
-      breakdown: data.data,
-    });
+    const krwBalance = parseFloat(result.data.total_krw);
+    res.status(200).json({ totalKRW: krwBalance });
   } catch (error) {
-    return res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message });
   }
 }
