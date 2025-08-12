@@ -1,17 +1,31 @@
 import crypto from "crypto";
 
-async function tryCall({ apiKey, secretKey, endpoint, bodyStr, mode }) {
+const ENC = (o) => new URLSearchParams(o).toString();
+
+async function tryCall({ apiKey, secretKey, endpoint, bodyStr, order, enc }) {
   const url = `https://api.bithumb.com${endpoint}`;
-  const nonce = (Date.now().toString() + Math.floor(Math.random() * 1000)).toString();
+  const nonce = Date.now().toString();
 
-  // mode1: endpoint \0 body \0 nonce (BASE64)  ← 가장 흔히 통과
-  // mode2: endpoint ; body ; nonce (BASE64)    ← 일부 사례에서 요구
-  const toSign =
-    mode === "mode1"
-      ? `${endpoint}\0${bodyStr}\0${nonce}`
-      : `${endpoint};${bodyStr};${nonce}`;
+  const parts = {
+    ENDPARAMS: bodyStr,       // body
+    ENDPOINT: endpoint,       // /info/balance
+    NONCE: nonce
+  };
 
-  const signature = crypto.createHmac("sha512", secretKey).update(toSign).digest("base64");
+  // 서명 순서 조합
+  const sequences = {
+    A: ["ENDPOINT", "ENDPARAMS", "NONCE"],         // (기본) endpoint \0 params \0 nonce
+    B: ["ENDPOINT", "NONCE", "ENDPARAMS"],         // endpoint \0 nonce \0 params
+    C: ["NONCE", "ENDPOINT", "ENDPARAMS"],         // nonce \0 endpoint \0 params
+  };
+
+  // 구분자 (NULL vs 세미콜론)
+  const sep = enc === "semicolon" ? ";" : "\0";
+  const toSign = sequences[order].map(k => parts[k]).join(sep);
+
+  // 인코딩(base64/hex) 2가지
+  const digestEnc = enc === "hex" ? "hex" : "base64";
+  const signature = crypto.createHmac("sha512", secretKey).update(toSign).digest(digestEnc);
 
   const headers = {
     "Api-Key": apiKey,
@@ -19,21 +33,20 @@ async function tryCall({ apiKey, secretKey, endpoint, bodyStr, mode }) {
     "Api-Nonce": nonce,
     "Api-Client-Type": "2",
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    Accept: "application/json",
+    "Accept": "application/json",
   };
 
   const resp = await fetch(url, { method: "POST", headers, body: bodyStr });
   const text = await resp.text();
   let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    return { ok: false, mode, error: "Non-JSON", raw: text, sent: { bodyStr, toSign } };
+  try { json = JSON.parse(text); } catch {
+    return { ok:false, order, enc, error:"Non-JSON", raw:text, sent:{ bodyStr, toSign, digestEnc } };
   }
   if (json.status === "0000") {
-    return { ok: true, mode, data: json, sent: { bodyStr, toSign } };
+    const krw = parseFloat(json?.data?.total_krw || "0");
+    return { ok:true, order, enc, totalKRW: krw, raw: json, sent:{ bodyStr, toSign, digestEnc } };
   }
-  return { ok: false, mode, error: "API", data: json, sent: { bodyStr, toSign } };
+  return { ok:false, order, enc, error:"API", data: json, sent:{ bodyStr, toSign, digestEnc } };
 }
 
 export default async function handler(req, res) {
@@ -46,25 +59,35 @@ export default async function handler(req, res) {
 
     const endpoint = "/info/balance";
 
-    // ✅ 핵심: 인코딩하지 않은 원문 body 사용 (슬래시 그대로)
-    const bodyStr = `endpoint=${endpoint}&currency=ALL`;
+    // (1) endpoint를 인코딩하지 않은 원문으로 body 구성 (권장)
+    const bodyRaw = `endpoint=${endpoint}&currency=ALL`;
+    // (2) endpoint를 URL 인코딩한 방식도 준비 (일부 환경)
+    const bodyEnc = ENC({ endpoint, currency: "ALL" }); // 자동 인코딩됨
 
-    // 1) null 구분자 방식 시도
-    const r1 = await tryCall({ apiKey, secretKey, endpoint, bodyStr, mode: "mode1" });
-    if (r1.ok) {
-      const krw = parseFloat(r1.data?.data?.total_krw || "0");
-      return res.status(200).json({ totalKRW: krw, mode: r1.mode, raw: r1.data, debug: r1.sent });
+    const tries = [];
+    // 순서 A/B/C × 인코딩(base64/hex/semicolon) × body(raw/enc)
+    const orders = ["A","B","C"];
+    const encs = ["base64","hex","semicolon"];
+
+    for (const bodyStr of [bodyRaw, bodyEnc]) {
+      for (const order of orders) {
+        for (const enc of encs) {
+          // eslint-disable-next-line no-await-in-loop
+          const r = await tryCall({ apiKey, secretKey, endpoint, bodyStr, order, enc });
+          tries.push(r);
+          if (r.ok) {
+            return res.status(200).json({
+              totalKRW: r.totalKRW,
+              mode: { body: bodyStr === bodyRaw ? "raw" : "encoded", order, enc },
+              raw: r.raw,
+              debug: r.sent
+            });
+          }
+        }
+      }
     }
 
-    // 2) 세미콜론 구분자 방식 시도
-    const r2 = await tryCall({ apiKey, secretKey, endpoint, bodyStr, mode: "mode2" });
-    if (r2.ok) {
-      const krw = parseFloat(r2.data?.data?.total_krw || "0");
-      return res.status(200).json({ totalKRW: krw, mode: r2.mode, raw: r2.data, debug: r2.sent });
-    }
-
-    // 모두 실패 시 시도 내역 반환
-    return res.status(500).json({ error: "Both strategies failed", attempts: [r1, r2] });
+    return res.status(500).json({ error: "All strategies failed", tries });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
