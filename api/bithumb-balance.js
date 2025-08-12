@@ -1,5 +1,56 @@
 import crypto from "crypto";
 
+async function callBithumb({ apiKey, secretKey, endpoint, paramsObj, mode }) {
+  const url = `https://api.bithumb.com${endpoint}`;
+  const nonce = Date.now().toString();
+
+  // mode A: body에 endpoint 넣지 않음, SIGN = endpoint \0 (params) \0 nonce, base64
+  // mode B: body에 endpoint 포함,  SIGN = endpoint \0 (paramsWithEndpoint) \0 nonce, base64
+  // mode C: body에 endpoint 넣지 않음, SIGN = endpoint \0 (params) \0 nonce, **hex**
+  const params = new URLSearchParams(paramsObj).toString();
+  const paramsWithEndpoint = new URLSearchParams({ ...paramsObj, endpoint }).toString();
+
+  let body, toSign, signEncoding;
+  if (mode === "A") {
+    body = params;
+    toSign = `${endpoint}\0${params}\0${nonce}`;
+    signEncoding = "base64";
+  } else if (mode === "B") {
+    body = paramsWithEndpoint;
+    toSign = `${endpoint}\0${paramsWithEndpoint}\0${nonce}`;
+    signEncoding = "base64";
+  } else {
+    // mode C
+    body = params;
+    toSign = `${endpoint}\0${params}\0${nonce}`;
+    signEncoding = "hex";
+  }
+
+  const signature = crypto.createHmac("sha512", secretKey).update(toSign).digest(signEncoding);
+
+  const headers = {
+    "Api-Key": apiKey,
+    "Api-Sign": signature,
+    "Api-Nonce": nonce,
+    "Api-Client-Type": "2",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "User-Agent": "Mozilla/5.0",
+  };
+
+  const resp = await fetch(url, { method: "POST", headers, body });
+  const text = await resp.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return { ok: false, mode, error: "Non-JSON", raw: text, sent: { body, toSign, signEncoding } };
+  }
+  if (json.status === "0000") {
+    return { ok: true, mode, data: json, sent: { body, toSign, signEncoding } };
+  }
+  return { ok: false, mode, error: "API", data: json, sent: { body, toSign, signEncoding } };
+}
+
 export default async function handler(req, res) {
   try {
     const apiKey = process.env.BITHUMB_API_KEY;
@@ -9,54 +60,35 @@ export default async function handler(req, res) {
     }
 
     const endpoint = "/info/balance";
-    const url = `https://api.bithumb.com${endpoint}`;
+    // ✅ 전체 잔고(원화 포함)를 위해 currency=ALL
+    const paramsObj = { currency: "ALL" };
 
-    // nonce는 절대 중복되면 안 됨 (동시요청 대비 랜덤 붙임)
-    const nonce = (Date.now().toString() + Math.floor(Math.random() * 1000)).toString();
-
-    // ✅ body에도 endpoint 포함 (가장 호환성 좋은 방식)
-    const bodyParams = new URLSearchParams({
-      endpoint,         // <- 중요
-      currency: "ALL",  // 전체 잔고 + total_krw 포함
-    }).toString();
-
-    // ✅ v1 서명: endpoint \0 bodyParams \0 nonce 를 HMAC-SHA512 후 BASE64
-    const toSign = `${endpoint}\0${bodyParams}\0${nonce}`;
-    const signature = crypto
-      .createHmac("sha512", secretKey)
-      .update(toSign)
-      .digest("base64");
-
-    const headers = {
-      "Api-Key": apiKey,
-      "Api-Sign": signature,
-      "Api-Nonce": nonce,
-      "Api-Client-Type": "2", // 일부 환경에서 요구됨(없어도 되지만 넣는 걸 권장)
-      "Content-Type": "application/x-www-form-urlencoded",
-    };
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: bodyParams, // 서명에 쓴 body와 정확히 동일해야 함
-    });
-
-    const text = await response.text();
-    let result;
-    try {
-      result = JSON.parse(text);
-    } catch {
-      return res.status(500).json({ error: "Non-JSON response from Bithumb", raw: text });
+    const attempts = [];
+    for (const mode of ["A", "B", "C"]) {
+      // 순차 시도
+      // A: (일반적으로 가장 많이 통과)
+      // B: 일부 환경에서 요구
+      // C: 드물게 hex 요구 사례(레거시) 대응
+      // eslint-disable-next-line no-await-in-loop
+      const r = await callBithumb({ apiKey, secretKey, endpoint, paramsObj, mode });
+      attempts.push(r);
+      if (r.ok) {
+        // 성공 시, total_krw만 추출해서 요약 + 진단정보 함께 반환
+        const krw = parseFloat(r.data?.data?.total_krw || "0");
+        return res.status(200).json({
+          totalKRW: krw,
+          mode: r.mode,
+          raw: r.data,
+          // 디버깅에 도움(원치 않으면 제거 가능)
+          debug: r.sent,
+        });
+      }
+      // 5100이면 다음 전략으로 진행
     }
 
-    if (result.status !== "0000") {
-      // 디버깅 편의: 원문 그대로 반환
-      return res.status(500).json({ error: "Bithumb API Error", data: result });
-    }
-
-    const krw = parseFloat(result.data.total_krw || "0");
-    return res.status(200).json({ totalKRW: krw, raw: result.data });
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
+    // 모두 실패하면, 시도 결과를 그대로 보여줌
+    return res.status(500).json({ error: "All strategies failed", attempts });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
   }
 }
