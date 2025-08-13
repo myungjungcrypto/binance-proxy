@@ -1,192 +1,189 @@
 // api/binance-btc-summary.js
-// 목적: Binance의 모든 지갑에서 보유한 BTC 수량(현물 총합) + BTC 선물 포지션 수량(USDM 위주)을 한 번에 반환
-// 주의: COIN-M(USD 기반 계약)은 별도 처리 필요. 기본은 USDT/TUSD 기반 USD-M의 BTC 포지션만 합산.
-// 필요 ENV: BINANCE_API_KEY, BINANCE_SECRET_KEY
-
 import crypto from "crypto";
 
-function sign(query, secret) {
-  return crypto.createHmac("sha256", secret).update(query).digest("hex");
-}
-
-async function fetchJson(url, { headers = {}, timeoutMs = 5000 } = {}) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const r = await fetch(url, { headers, signal: controller.signal });
-    const text = await r.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch (_) {}
-    return { ok: r.ok, status: r.status, json, text };
-  } catch (e) {
-    return { ok: false, status: 0, error: String(e) };
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-function num(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : 0;
-}
+/**
+ * 목적
+ * 1) 현물/마진 지갑 등 "보유 BTC 수량" 합계 (지갑별 상세 + 합계)
+ * 2) USDⓈ-M 선물의 BTC 포지션 수량 합계 (PM 계정이면 PAPI에서, 일반은 FAPI에서)
+ *    - 필요 시 COIN-M도 포함 가능 (?includeCoinM=true)
+ *
+ * 필요 환경변수 (Vercel Dashboard > Settings > Environment Variables)
+ * - BINANCE_API_KEY
+ * - BINANCE_SECRET_KEY
+ */
 
 export default async function handler(req, res) {
   try {
     const apiKey = process.env.BINANCE_API_KEY;
     const secretKey = process.env.BINANCE_SECRET_KEY;
     if (!apiKey || !secretKey) {
-      return res.status(500).json({ error: "Missing API credentials" });
+      return res.status(500).json({ error: "Missing Binance API credentials" });
     }
 
-    const ts = Date.now();
-    const commonHeaders = { "X-MBX-APIKEY": apiKey };
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const debug = urlObj.searchParams.get("debug") === "1";
+    const includeCoinM = urlObj.searchParams.get("includeCoinM") === "true";
 
-    // 헬퍼: 서명 붙여 호출
-    const callSigned = async (baseUrl, path, paramsObj = {}, timeoutMs = 6000) => {
-      const params = new URLSearchParams({ ...paramsObj, timestamp: String(ts) });
-      const sig = sign(params.toString(), secretKey);
-      const url = `${baseUrl}${path}?${params.toString()}&signature=${sig}`;
-      return await fetchJson(url, { headers: commonHeaders, timeoutMs });
+    // ---------- 공용: 서명 호출 ----------
+    const signQuery = (q) =>
+      crypto.createHmac("sha256", secretKey).update(q).digest("hex");
+
+    const callSigned = async (base, path, extra = "") => {
+      const timestamp = Date.now();
+      const recvWindow = 60_000;
+      const q = `recvWindow=${recvWindow}&timestamp=${timestamp}${
+        extra ? `&${extra}` : ""
+      }`;
+      const sig = signQuery(q);
+      const url = `${base}${path}?${q}&signature=${sig}`;
+      const r = await fetch(url, { headers: { "X-MBX-APIKEY": apiKey } });
+      const text = await r.text();
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch (_) {
+        // non-JSON 응답
+      }
+      return { ok: r.ok, status: r.status, json, text, url };
     };
 
-    // 1) SPOT(현물) BTC: /api/v3/account → balances[] 에서 BTC 찾기
-    const spotP = callSigned(
+    // ---------- 1) 지갑별 BTC 잔고 (BTC로 환산된 합계) ----------
+    // 공식 문서: GET /sapi/v1/asset/wallet/balance?quoteAsset=BTC
+    // (일부 권한 없이 동작하는 케이스 존재. 안되면 유니버설 트랜스퍼 권한 필요)
+    const walletR = await callSigned(
       "https://api.binance.com",
-      "/api/v3/account"
+      "/sapi/v1/asset/wallet/balance",
+      "quoteAsset=BTC"
     );
 
-    // 2) FUNDING(펀딩 지갑) BTC: /sapi/v1/asset/get-funding-asset?asset=BTC
-    const fundingP = callSigned(
-      "https://api.binance.com",
-      "/sapi/v1/asset/get-funding-asset",
-      { asset: "BTC" }
-    );
+    if (!walletR.ok || !Array.isArray(walletR.json)) {
+      return res.status(502).json({
+        error: "Wallet balance fetch failed",
+        hint: "Check API key permission or try later",
+        upstream: { status: walletR.status, body: walletR.text?.slice(0, 200) },
+      });
+    }
 
-    // 3) CROSS MARGIN BTC: /sapi/v1/margin/account → userAssets[] 내 BTC
-    const crossMarginP = callSigned(
-      "https://api.binance.com",
-      "/sapi/v1/margin/account"
-    );
+    // 지갑 이름들 예시:
+    // Spot, Funding, Cross Margin, Isolated Margin, USDⓈ-M Futures, COIN-M Futures, Earn, Trading Bots, Copy Trading ...
+    const pick = (name) =>
+      Number(
+        walletR.json.find((x) => String(x.walletName) === name)?.balance ?? 0
+      );
 
-    // 4) ISOLATED MARGIN BTC(선택): 심볼 전부는 무거워서 BTC 관련 대표 심볼만 시도
-    // 필요시 배열에 BTC 관련 심볼 추가
-    const isoSymbols = ["BTCUSDT", "BTCTUSD"];
-    const isolatedPromises = isoSymbols.map(sym =>
-      callSigned("https://api.binance.com", "/sapi/v1/margin/isolated/account", { symbols: sym })
-    );
+    // Spot 그룹(현물로 간주할 지갑들): 선물/옵션/복사거래 등 명백히 파생상품 성격은 제외
+    const SPOT_LIKE = new Set([
+      "Spot",
+      "Funding",
+      "Cross Margin",
+      "Cross Margin (PM)",
+      "Isolated Margin",
+      "Earn",
+      "Trading Bots",
+      "Copy Trading", // 필요 시 제외 가능
+    ]);
 
-    // 5) USDⓈ-M Futures BTC 포지션: /fapi/v2/positionRisk → symbol startsWith('BTC') 합산
-    const futuresUsdmP = callSigned(
-      "https://fapi.binance.com",
-      "/fapi/v2/positionRisk"
-    );
-
-    // (선택) 6) COIN-M Futures (BTCUSD 등) — 필요시 주석 해제
-    // const futuresCoinmP = callSigned(
-    //   "https://dapi.binance.com",
-    //   "/dapi/v1/positionRisk"
-    // );
-
-    const [
-      spotR, fundingR, crossMarginR, ...rest
-    ] = await Promise.all([spotP, fundingP, crossMarginP, ...isolatedPromises, futuresUsdmP /*, futuresCoinmP*/]);
-
-    const futuresUsdmR = rest[isolatedPromises.length]; // 마지막 요소가 USDM 결과
-    // const futuresCoinmR = rest[isolatedPromises.length + 1];
-
-    // ---- 파싱 ----
-    // SPOT
     let spotBTC = 0;
-    if (spotR.ok && spotR.json?.balances) {
-      const btc = spotR.json.balances.find(b => b.asset === "BTC");
-      if (btc) spotBTC = num(btc.free) + num(btc.locked);
+    const perWallet = {};
+    for (const w of walletR.json) {
+      const name = String(w.walletName ?? "");
+      const bal = Number(w.balance ?? 0);
+      perWallet[name] = bal;
+      if (SPOT_LIKE.has(name)) spotBTC += bal;
     }
 
-    // FUNDING
-    let fundingBTC = 0;
-    if (fundingR.ok && Array.isArray(fundingR.json)) {
-      // [{ asset:"BTC", free:"", locked:"", freeze:"" ... }]
-      for (const it of fundingR.json) {
-        if (it.asset === "BTC") {
-          fundingBTC += num(it.free) + num(it.locked) + num(it.freeze);
-        }
+    // 몇 개 대표 필드로도 제공
+    const spotBreakdown = {
+      spotBTC: perWallet["Spot"] ?? 0,
+      fundingBTC: perWallet["Funding"] ?? 0,
+      marginCrossBTC:
+        (perWallet["Cross Margin (PM)"] ?? 0) + (perWallet["Cross Margin"] ?? 0),
+      marginIsoBTC: perWallet["Isolated Margin"] ?? 0,
+      // 참고용: 여기 포함하지 않는 파생지갑
+      // usdmFuturesBTC: perWallet["USDⓈ-M Futures"] ?? 0,
+      // coinmFuturesBTC: perWallet["COIN-M Futures"] ?? 0,
+      spotTotalBTC: +spotBTC.toFixed(8),
+    };
+
+    // ---------- 2) USDⓈ-M BTC 포지션 (PM → 일반 폴백) ----------
+    // PM/Unified 계정은 PAPI로, 일반은 FAPI로.
+    // 응답 리스트에서 symbol이 'BTC'로 시작하는 항목의 positionAmt 절대값 합산.
+    const getUsdmBtcPos = async () => {
+      // PM 우선(papi)
+      const papi = await callSigned(
+        "https://papi.binance.com",
+        "/papi/v1/um/positionRisk"
+      );
+      let list = Array.isArray(papi.json) && papi.ok ? papi.json : null;
+
+      // 실패 시 일반(fapi)
+      if (!list) {
+        const fapi = await callSigned(
+          "https://fapi.binance.com",
+          "/fapi/v2/positionRisk"
+        );
+        list = Array.isArray(fapi.json) && fapi.ok ? fapi.json : [];
       }
-    }
 
-    // CROSS MARGIN
-    let marginCrossBTC = 0;
-    if (crossMarginR.ok && crossMarginR.json?.userAssets) {
-      const btc = crossMarginR.json.userAssets.find(a => a.asset === "BTC");
-      if (btc) {
-        // 순 BTC = free + locked - borrowed + interest? (단순 보유량만 합산: free + locked)
-        marginCrossBTC = num(btc.free) + num(btc.locked);
-      }
-    }
-
-    // ISOLATED MARGIN (BTC 관련 심볼만)
-    let marginIsoBTC = 0;
-    for (let i = 0; i < isolatedPromises.length; i++) {
-      const r = rest[i];
-      if (r?.ok && r.json?.assets) {
-        // assets: [{baseAsset:{asset:'BTC', free, locked}, quoteAsset:{...}}]
-        for (const a of r.json.assets) {
-          if (a?.baseAsset?.asset === "BTC") {
-            marginIsoBTC += num(a.baseAsset.free) + num(a.baseAsset.locked);
-          }
-          // 혹시 quote 에 BTC가 들어갈 일은 거의 없지만 안전 차단
-          if (a?.quoteAsset?.asset === "BTC") {
-            marginIsoBTC += num(a.quoteAsset.free) + num(a.quoteAsset.locked);
-          }
-        }
-      }
-    }
-
-    // 현물/마진 총합
-    const spotTotalBTC = spotBTC + fundingBTC + marginCrossBTC + marginIsoBTC;
-
-    // USDⓈ-M Futures BTC 포지션
-    // positionRisk[]: symbol, positionAmt, markPrice ...
-    // BTCUSDT, BTCTUSD 등 BTC로 시작하는 심볼만 합산 (절대값 기준; 필요에 따라 순수량으로 바꾸려면 abs 제거)
-    let futuresBtcUsdm = 0;
-    if (futuresUsdmR?.ok && Array.isArray(futuresUsdmR.json)) {
-      for (const p of futuresUsdmR.json) {
+      let sum = 0;
+      for (const p of list) {
         const sym = String(p.symbol || "");
-        if (!sym.startsWith("BTC")) continue;
-        const qty = num(p.positionAmt); // USDM은 base 수량 단위(=BTC)
-        if (qty !== 0) futuresBtcUsdm += Math.abs(qty);
+        if (!sym.startsWith("BTC")) continue; // BTCUSDT, BTCUSDC, BTCTUSD 등
+        const qty = Number(p.positionAmt);
+        if (Number.isFinite(qty) && qty !== 0) sum += Math.abs(qty);
       }
-    } else if (futuresUsdmR?.json && futuresUsdmR?.json?.code) {
-      // 에러 케이스 전달
-      // nothing
+      return +sum.toFixed(8);
+    };
+
+    // ---------- (옵션) COIN-M BTC 포지션 ----------
+    const getCoinmBtcPos = async () => {
+      // PM 계정에서도 coin-M은 dapi 쪽 사용 (papi coin-m positionRisk가 별도이긴 하나 dapi가 보편)
+      const dapi = await callSigned(
+        "https://dapi.binance.com",
+        "/dapi/v1/positionRisk"
+      );
+      if (!Array.isArray(dapi.json)) return 0;
+
+      // COIN‑M은 계약 단위 주의 필요. BTCUSD 퍼페추얼의 quantity는 "계약수"이며,
+      // 일반적으로 1 계약 = 100 USD 기준값인 경우가 있음.
+      // 여기서는 간단히 BTC 기반 심볼만 골라서 (예: BTCUSD) notionalValue/markPrice 등으로 환산하려면 추가 로직 필요.
+      // 일단 BTC 심볼만 골라 "코인 수량"과 유사한 값으로 추정하려면:
+      // - 일부 응답에는 positionAmt가 코인수인 마켓도 있으므로 우선 절대값 합산(보수적).
+      let sum = 0;
+      for (const p of dapi.json) {
+        const sym = String(p.symbol || "");
+        if (!sym.startsWith("BTC")) continue; // BTCUSD, BTCUSD_PERP 등
+        const qty = Number(p.positionAmt);
+        if (Number.isFinite(qty) && qty !== 0) sum += Math.abs(qty);
+      }
+      return +sum.toFixed(8);
+    };
+
+    const [usdM_BTCpos, coinM_BTCpos] = await Promise.all([
+      getUsdmBtcPos(),
+      includeCoinM ? getCoinmBtcPos() : Promise.resolve(0),
+    ]);
+
+    const out = {
+      spot: spotBreakdown,
+      futures: {
+        usdM_BTCpos,
+        ...(includeCoinM ? { coinM_BTCpos } : {}),
+      },
+      t: Date.now(),
+    };
+
+    if (debug) {
+      out._debugSample = {
+        // 지갑 이름과 값 일부만 표시(많으면 잘라냄)
+        wallets: Object.fromEntries(
+          Object.entries(perWallet).slice(0, 12)
+        ),
+      };
     }
 
-    // (선택) COIN-M — 계약수/명목 등의 차이가 있어 정확 합산이 까다로워 기본 제외
-    // let futuresBtcCoinm = 0;
-    // if (futuresCoinmR?.ok && Array.isArray(futuresCoinmR.json)) {
-    //   for (const p of futuresCoinmR.json) {
-    //     const sym = String(p.symbol || "");
-    //     if (!sym.startsWith("BTC")) continue;
-    //     const qty = num(p.positionAmt); // Coin-M 명세에 따라 해석 주의 (여기선 단순 합)
-    //     if (qty !== 0) futuresBtcCoinm += Math.abs(qty);
-    //   }
-    // }
-
-    return res.status(200).json({
-      spot: {
-        spotBTC: +spotBTC.toFixed(8),
-        fundingBTC: +fundingBTC.toFixed(8),
-        marginCrossBTC: +marginCrossBTC.toFixed(8),
-        marginIsoBTC: +marginIsoBTC.toFixed(8),
-        spotTotalBTC: +spotTotalBTC.toFixed(8)
-      },
-      futures: {
-        usdM_BTCpos: +futuresBtcUsdm.toFixed(8)
-        // , coinM_BTCpos: +futuresBtcCoinm.toFixed(8)
-      },
-      notes: "COIN-M 선물은 기본 제외(주석). 필요시 주석 해제 및 계약단위 확인 후 사용.",
-      t: Date.now()
-    });
-  } catch (err) {
-    return res.status(500).json({ error: String(err) });
+    return res.status(200).json(out);
+  } catch (e) {
+    return res.status(500).json({ error: e.message || String(e) });
   }
 }
