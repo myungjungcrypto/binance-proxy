@@ -9,7 +9,7 @@ function sign(ts, method, path, query, body, secret) {
 export default async function handler(req, res) {
   try {
     const apiKey = process.env.BITGET_API_KEY;
-    const apiSecret = process.env.BITGET_API_SECRET;
+    const apiSecret = process.env.BITGET_SECRET_KEY;
     const passphrase = process.env.BITGET_API_PASSPHRASE;
     if (!apiKey || !apiSecret || !passphrase) {
       return res.status(500).json({ error: "Missing Bitget API credentials" });
