@@ -66,56 +66,74 @@ export default async function handler(req, res) {
     }
     dbg.steps.push({ spotPricePairs: tickAll.json.length });
 
- // ----- 1) 선물 USDⓈ-M 포지션 합계 (ALT만) -----
+ // ----- 1) 선물 USD-M 포지션 합계 (ALT만) -----
 let altFuturesUSD = 0;
 let altFuturesTop = [];
+
+async function getServerTimeFapi() {
+  const r = await fetchJson("https://fapi.binance.com/fapi/v1/time");
+  return r.ok ? Number(r.json?.serverTime) || Date.now() : Date.now();
+}
+
 {
-  const qs = new URLSearchParams({ timestamp: String(ts) }).toString();
-  const url = `https://fapi.binance.com/fapi/v2/positionRisk?${qs}&signature=${sign(secretKey, qs)}`;
-  const r = await fetchJson(url, { headers });
+  const recvWindow = 5000;
+  const localTs = Date.now();
+  let serverTs = await getServerTimeFapi();
+  let drift = serverTs - localTs;
 
-  dbg.steps.push({ fapi_positionRisk_status: r.status, count: Array.isArray(r.json) ? r.json.length : null });
-
-  // USDT + USDC + FDUSD(원하시면 주석 풉니다)
-  const QUOTES = ["USDT", "USDC" /*, "FDUSD"*/];
-  const FUTURES_EXCLUDED_BASE = new Set(["BTC", "ETH"]);
-
-  // 심볼가격 폴백 캐시
-  const priceCache = new Map();
-  async function getFuturesPrice(symbol) {
-    if (priceCache.has(symbol)) return priceCache.get(symbol);
-    const pr = await fetchJson(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, { headers });
-    const px = pr.ok ? Number(pr.json?.price) : 0;
-    priceCache.set(symbol, px || 0);
-    return px || 0;
+  async function fetchPositions(tsOverride) {
+    const ts = (tsOverride ?? Date.now()) + drift;
+    const qs = new URLSearchParams({
+      timestamp: String(ts),
+      recvWindow: String(recvWindow),
+    }).toString();
+    const url = `https://fapi.binance.com/fapi/v2/positionRisk?${qs}&signature=${sign(secretKey, qs)}`;
+    return fetchJson(url, { headers });
   }
 
-  // positionRisk 실패/빈배열이면 fapi account로 백업
-  let positions = Array.isArray(r.json) ? r.json : null;
-  if (!positions || positions.length === 0) {
-    const rAcc = await fetchJson(`https://fapi.binance.com/fapi/v2/account?${qs}&signature=${sign(secretKey, qs)}`, { headers });
-    dbg.steps.push({ fapi_account_status: rAcc.status, hasPositions: !!rAcc?.json?.positions?.length });
-    if (rAcc.ok && Array.isArray(rAcc.json?.positions)) {
-      // account.positions의 필드명은 약간 다름 (positionAmt/entryPrice 등 동일 사용 가능)
-      positions = rAcc.json.positions;
+  // 1차 시도
+  let r = await fetchPositions();
+  // 401/418/429 등일 때 디버그용으로 text도 남겨둠
+  if (!r.ok) {
+    // 서버 타임 다시 동기화 후 1회 재시도
+    serverTs = await getServerTimeFapi();
+    drift = serverTs - Date.now();
+    r = await fetchPositions();
+  }
+
+  // 디버그 기록
+  dbg.steps.push({
+    fapi_positionRisk_status: r.status,
+    count: Array.isArray(r.json) ? r.json.length : null,
+    textSample: r.text ? String(r.text).slice(0, 120) : undefined,
+  });
+
+  if (r.ok && Array.isArray(r.json)) {
+    const QUOTES = ["USDT"]; // USDT 마켓만
+    const FUTURES_EXCLUDED_BASE = new Set(["BTC", "ETH"]); // 알트만 포함
+
+    const priceCache = new Map();
+    async function getFuturesPrice(symbol) {
+      if (priceCache.has(symbol)) return priceCache.get(symbol);
+      const pr = await fetchJson(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, { headers });
+      const px = pr.ok ? Number(pr.json?.price) : 0;
+      priceCache.set(symbol, px || 0);
+      return px || 0;
     }
-  }
 
-  if (positions && positions.length) {
-    dbg.steps.push({ futuresSample: positions.slice(0, 3) }); // 디버그 샘플
-
-    for (const pos of positions) {
+    for (const pos of r.json) {
       const amt = Number(pos?.positionAmt || 0);
       if (!amt) continue;
 
       const symbol = String(pos?.symbol || "");
-      if (!QUOTES.some(q => symbol.endsWith(q))) continue;
-
+      if (!QUOTES.some(q => symbol.endsWith(q))) continue; // USDT 마켓만
       const base = baseAssetFromSymbol(symbol);
-      if (FUTURES_EXCLUDED_BASE.has(base)) continue; // BTC/ETH 제외
+      if (FUTURES_EXCLUDED_BASE.has(base)) continue;        // BTC/ETH 제외
 
-      // 우선순위: notional → markPrice → (심볼가격)
-      let usd = Math.abs(Number(pos?.notional || 0));
+      // notional(USDT) → markPrice 폴백 → ticker 가격 폴백
+      const notional = Number(pos?.notional || 0);
+      let usd = Math.abs(notional);
+
       if (!usd) {
         const mark = Number(pos?.markPrice || 0);
         if (mark) usd = Math.abs(amt * mark);
@@ -124,21 +142,19 @@ let altFuturesTop = [];
         const px = await getFuturesPrice(symbol);
         if (px) usd = Math.abs(amt * px);
       }
-
       if (!usd) {
         dbg.filtered = dbg.filtered || [];
-        dbg.filtered.push({ symbol, base, amt, reason: "zero_usd_all_sources" });
+        dbg.filtered.push({ symbol, base, amt, notional, mark: Number(pos?.markPrice || 0), reason: "zero_usd" });
         continue;
       }
 
       if (usd >= MIN_USD) {
         altFuturesUSD += usd;
         altFuturesTop.push({
-          symbol,
-          base,
+          symbol, base,
           positionSide: pos.positionSide || "BOTH",
           positionAmt: Number(amt.toFixed(6)),
-          notional: pos?.notional ? Number(Number(pos.notional).toFixed(2)) : null,
+          notional: notional ? Number(notional.toFixed(2)) : null,
           markPrice: pos?.markPrice ? Number(Number(pos.markPrice).toFixed(6)) : null,
           usd: Number(usd.toFixed(2)),
         });
