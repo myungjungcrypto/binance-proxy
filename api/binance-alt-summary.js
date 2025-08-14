@@ -67,43 +67,54 @@ export default async function handler(req, res) {
     dbg.steps.push({ spotPricePairs: tickAll.json.length });
 
     // ----- 1) 선물 USD-M 포지션 합계 (ALT만) -----
-    let altFuturesUSD = 0;
-    let altFuturesTop = [];
-    {
-      const qs = new URLSearchParams({ timestamp: String(ts) }).toString();
-      const url = `https://fapi.binance.com/fapi/v2/positionRisk?${qs}&signature=${sign(secretKey, qs)}`;
-      const r = await fetchJson(url, { headers });
-      dbg.steps.push({ fapi_status: r.status, count: Array.isArray(r.json) ? r.json.length : 0 });
+let altFuturesUSD = 0;
+let altFuturesTop = [];
+{
+  const qs = new URLSearchParams({ timestamp: String(ts) }).toString();
+  const url = `https://fapi.binance.com/fapi/v2/positionRisk?${qs}&signature=${sign(secretKey, qs)}`;
+  const r = await fetchJson(url, { headers });
+  dbg.steps.push({ fapi_status: r.status, count: Array.isArray(r.json) ? r.json.length : 0 });
 
-      if (r.ok && Array.isArray(r.json)) {
-        for (const pos of r.json) {
-          const amt = toNum(pos.positionAmt);
-          if (!amt) continue;
-          const symbol = String(pos.symbol || "");
-          // USDⓈ-M 만 집계 (USDT/USDC 마켓)
-          if (!symbol.endsWith("USDT") && !symbol.endsWith("USDC")) continue;
+  if (r.ok && Array.isArray(r.json)) {
+    // 사용자는 USDT 마켓만이라고 하셨으니 USDT만 필터(원하시면 USDC/FDUSD/BUSD 추가 가능)
+    const QUOTES = ["USDT"]; // 필요 시 ["USDT","USDC","FDUSD","BUSD"]
 
-          const base = baseAssetFromSymbol(symbol);
-          if (EXCLUDED.has(base)) continue;
+    for (const pos of r.json) {
+      const amt = toNum(pos.positionAmt);
+      if (!amt) continue;
 
-          const mark = toNum(pos.markPrice);
-          if (!mark) continue;
+      const symbol = String(pos.symbol || "");
+      if (!QUOTES.some(q => symbol.endsWith(q))) continue;
 
-          const usd = Math.abs(amt * mark);
-          if (usd >= MIN_USD) {
-            altFuturesUSD += usd;
-            altFuturesTop.push({
-              symbol, base,
-              positionAmt: Number(amt.toFixed(6)),
-              markPrice: Number(mark.toFixed(6)),
-              usd: Number(usd.toFixed(2)),
-            });
-          }
-        }
-        altFuturesTop.sort((a, b) => b.usd - a.usd);
-        altFuturesTop = altFuturesTop.slice(0, 25);
+      // 기초자산 추출 (예: ARBUSDT -> ARB)
+      const base = baseAssetFromSymbol(symbol);
+      if (EXCLUDED.has(base)) continue; // BTC/ETH/USDT/USDC 제외(알트만)
+
+      // ✅ notional(USDT 단위)이 제일 신뢰도 높음 → 1순위!
+      const notional = toNum(pos.notional);
+      const mark = toNum(pos.markPrice);
+
+      // notional이 있으면 그걸 쓰고, 없으면 mark*qty로 폴백
+      const usd = Math.abs(notional || (amt * mark));
+      if (!usd) continue;
+
+      if (usd >= MIN_USD) {
+        altFuturesUSD += usd;
+        altFuturesTop.push({
+          symbol, base,
+          positionSide: pos.positionSide || "BOTH",
+          positionAmt: Number(amt.toFixed(6)),
+          markPrice: mark ? Number(mark.toFixed(6)) : null,
+          notional: notional ? Number(notional.toFixed(2)) : null,
+          usd: Number(usd.toFixed(2)),
+        });
       }
     }
+
+    altFuturesTop.sort((a, b) => b.usd - a.usd);
+    altFuturesTop = altFuturesTop.slice(0, 25);
+  }
+}
 
     // ----- 2) 지갑(Spot/Funding/Margin 등) ALT USD 합계 -----
     // 2-1) 1순위: getUserAsset?needBtcValuation=true
