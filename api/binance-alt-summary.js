@@ -1,10 +1,9 @@
 // api/binance-alt-summary.js
 import crypto from "crypto";
 
-const EXCLUDED = new Set(["BTC", "ETH", "USDT", "USDC"]); // 지갑 계산에서 제외(USDT/USDC 자체 잔고 제외)
+const EXCLUDED = new Set(["BTC", "ETH", "USDT", "USDC"]); // 지갑 합산에서 제외(USDT/USDC, BTC/ETH 제외)
 const MIN_USD = 100;
 
-// ---------- utils ----------
 function sign(secret, qs) {
   return crypto.createHmac("sha256", secret).update(qs).digest("hex");
 }
@@ -14,39 +13,30 @@ async function fetchJson(url, init = {}, timeoutMs = 10000) {
   try {
     const r = await fetch(url, { ...init, signal: ctrl.signal });
     const text = await r.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch {}
+    let json = null; try { json = JSON.parse(text); } catch {}
     return { ok: r.ok, status: r.status, json, text };
   } catch (e) {
     return { ok: false, status: 0, error: String(e) };
-  } finally {
-    clearTimeout(t);
-  }
+  } finally { clearTimeout(t); }
 }
-function toNum(v, d = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
-}
-function baseAssetFromSymbol(symbol) {
-  // e.g. ADAUSDT -> ADA, ARBUSDC -> ARB
-  return symbol.replace(/(USDT|USDC|BUSD)$/,"");
-}
+function toNum(v, d = 0) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+function baseAssetFromSymbol(symbol) { return symbol.replace(/(USDT|USDC|BUSD)$/,""); }
 function pushUSD(map, asset, usd) {
-  if (!asset || EXCLUDED.has(asset)) return;        // USDT/USDC/ BTC/ETH 제외
+  if (!asset || EXCLUDED.has(asset)) return;
   if (!Number.isFinite(usd) || usd <= 0) return;
   map.set(asset, (map.get(asset) || 0) + usd);
 }
 
 export default async function handler(req, res) {
   try {
-    const apiKey = process.env.BINANCE_API_KEY;
-    const secretKey = process.env.BINANCE_SECRET_KEY;
-    if (!apiKey || !secretKey) {
-      return res.status(500).json({ error: "Missing Binance API credentials" });
-    }
+    // ✅ 계정 선택 (acct=2면 BINANCE2_* 사용)
+    const useAcct2 = (req.query?.acct === "2");
+    const apiKey    = useAcct2 ? process.env.BINANCE2_API_KEY    : process.env.BINANCE_API_KEY;
+    const secretKey = useAcct2 ? process.env.BINANCE2_SECRET_KEY : process.env.BINANCE_SECRET_KEY;
+    if (!apiKey || !secretKey) return res.status(500).json({ error: "Missing Binance API credentials" });
+
     const headers = { "X-MBX-APIKEY": apiKey };
     const debugMode = (req.query?.debug === "1" || req.query?.debug === "true");
-    const ts0 = Date.now();
     const dbg = { steps: [] };
 
     // ----- 0) 스팟 가격 테이블 (USDT/USDC 마켓) -----
@@ -54,8 +44,8 @@ export default async function handler(req, res) {
     if (!tickAll.ok || !Array.isArray(tickAll.json)) {
       return res.status(502).json({ error: "Failed to fetch spot prices", detail: tickAll });
     }
-    const priceUSDT = new Map(); // BASE -> price in USDT
-    const priceUSDC = new Map(); // BASE -> price in USDC
+    const priceUSDT = new Map();
+    const priceUSDC = new Map();
     for (const it of tickAll.json) {
       const s = String(it.symbol || "");
       const p = toNum(it.price);
@@ -65,110 +55,90 @@ export default async function handler(req, res) {
     }
     dbg.steps.push({ spotPricePairs: tickAll.json.length });
 
-    // ===== 1) 선물 USD-M 포지션 합계 (ALT만: BTC/ETH 제외, USDT 마켓) =====
+    // ===== 1) USDⓈ-M 선물 ALT 포지션(USDT 마켓, BTC/ETH 제외) =====
     let altFuturesUSD = 0;
     let altFuturesTop = [];
 
-    async function getServerTimeFapi() {
-      const r = await fetchJson("https://fapi.binance.com/fapi/v1/time");
-      return r.ok ? Number(r.json?.serverTime) || Date.now() : Date.now();
-    }
-    {
-      const recvWindow = 5000;
-      const localTs = Date.now();
-      let serverTs = await getServerTimeFapi();
-      let drift = serverTs - localTs;
+    const recvWindow = 5000;
+    const mkQs = (extra={}) => new URLSearchParams({
+      timestamp: String(Date.now()),
+      recvWindow: String(recvWindow),
+      ...extra
+    }).toString();
 
-      async function fetchPositions(tsOverride) {
-        const ts = (tsOverride ?? Date.now()) + drift;
-        const qs = new URLSearchParams({
-          timestamp: String(ts),
-          recvWindow: String(recvWindow),
-        }).toString();
-        const url = `https://fapi.binance.com/fapi/v2/positionRisk?${qs}&signature=${sign(secretKey, qs)}`;
-        return fetchJson(url, { headers });
-      }
-
-      let r = await fetchPositions();
-      if (!r.ok) {
-        serverTs = await getServerTimeFapi();
-        drift = serverTs - Date.now();
-        r = await fetchPositions();
-      }
-
-      // 필요 시 대안: 포트폴리오/Unified 계정은 PAPI에서 포지션을 제공하기도 함
-      if (!r.ok) {
-        const qs = new URLSearchParams({ timestamp: String(Date.now()) }).toString();
-        const url = `https://papi.binance.com/papi/v1/um/positionRisk?${qs}&signature=${sign(secretKey, qs)}`;
-        const rp = await fetchJson(url, { headers });
-        dbg.steps.push({ futuresFetch: { fapi: { status: r.status, textSample: r.text?.slice(0,120) }, papi: { status: rp.status, textSample: rp.text?.slice(0,120) } }});
-        if (rp.ok) r = rp;
-      } else {
-        dbg.steps.push({ futuresFetch: { fapi: { status: r.status, textSample: r.text?.slice(0,120) } }});
-      }
-
-      if (r.ok && Array.isArray(r.json)) {
-        const QUOTES = ["USDT"]; // USDT 마켓만
-        const FUTURES_EXCLUDED_BASE = new Set(["BTC", "ETH"]); // 알트만
-
-        const priceCache = new Map();
-        async function getFuturesPrice(symbol) {
-          if (priceCache.has(symbol)) return priceCache.get(symbol);
-          const pr = await fetchJson(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, { headers });
-          const px = pr.ok ? Number(pr.json?.price) : 0;
-          priceCache.set(symbol, px || 0);
-          return px || 0;
-        }
-
-        for (const pos of r.json) {
-          const amt = Number(pos?.positionAmt || 0);
-          if (!amt) continue;
-
-          const symbol = String(pos?.symbol || "");
-          if (!QUOTES.some(q => symbol.endsWith(q))) continue; // USDT 마켓만
-          const base = baseAssetFromSymbol(symbol);
-          if (FUTURES_EXCLUDED_BASE.has(base)) continue;        // BTC/ETH 제외
-
-          // 우선순위: notional(USDT) → markPrice → ticker 가격
-          const notional = Number(pos?.notional || 0);
-          let usd = Math.abs(notional);
-
-          if (!usd) {
-            const mark = Number(pos?.markPrice || 0);
-            if (mark) usd = Math.abs(amt * mark);
-          }
-          if (!usd) {
-            const px = await getFuturesPrice(symbol);
-            if (px) usd = Math.abs(amt * px);
-          }
-          if (!usd) continue;
-
-          if (usd >= MIN_USD) {
-            altFuturesUSD += usd;
-            altFuturesTop.push({
-              symbol, base,
-              positionSide: pos.positionSide || "BOTH",
-              positionAmt: Number(amt.toFixed(6)),
-              notional: notional ? Number(notional.toFixed(2)) : null,
-              markPrice: pos?.markPrice ? Number(Number(pos.markPrice).toFixed(6)) : null,
-              usd: Number(usd.toFixed(2)),
-            });
-          }
-        }
-
-        altFuturesTop.sort((a, b) => b.usd - a.usd);
-        altFuturesTop = altFuturesTop.slice(0, 25);
-      }
+    // 우선 FAPI → 실패 시 PAPI (Unified/PM)
+    let posRes = await fetchJson(
+      `https://fapi.binance.com/fapi/v2/positionRisk?${mkQs()}` +
+      `&signature=${sign(secretKey, mkQs())}`,
+      { headers }
+    );
+    if (!posRes.ok) {
+      const qs = mkQs();
+      const url = `https://papi.binance.com/papi/v1/um/positionRisk?${qs}&signature=${sign(secretKey, qs)}`;
+      const rp = await fetchJson(url, { headers });
+      dbg.steps.push({ futuresFetch: { fapi: { status: posRes.status, textSample: posRes.text?.slice(0,120) }, papi: { status: rp.status, textSample: rp.text?.slice(0,120) } }});
+      if (rp.ok) posRes = rp;
+    } else {
+      dbg.steps.push({ futuresFetch: { fapi: { status: posRes.status, textSample: posRes.text?.slice(0,120) } }});
     }
 
-    // ===== 2) 지갑(Spot/Funding/Margin/Isolated/Earn) ALT USD 합계 =====
-    const assetUSD = new Map(); // asset -> USD
+    if (posRes.ok && Array.isArray(posRes.json)) {
+      const QUOTES = ["USDT"]; // USDT 마켓만
+      const FUTURES_EXCLUDED_BASE = new Set(["BTC", "ETH"]);
+
+      const priceCache = new Map();
+      async function getFuturesPrice(symbol) {
+        if (priceCache.has(symbol)) return priceCache.get(symbol);
+        const pr = await fetchJson(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, { headers });
+        const px = pr.ok ? Number(pr.json?.price) : 0;
+        priceCache.set(symbol, px || 0);
+        return px || 0;
+      }
+
+      for (const pos of posRes.json) {
+        const amt = Number(pos?.positionAmt || 0);
+        if (!amt) continue;
+
+        const symbol = String(pos?.symbol || "");
+        if (!QUOTES.some(q => symbol.endsWith(q))) continue;
+        const base = baseAssetFromSymbol(symbol);
+        if (FUTURES_EXCLUDED_BASE.has(base)) continue;
+
+        const notional = Number(pos?.notional || 0);
+        let usd = Math.abs(notional);
+        if (!usd) {
+          const mark = Number(pos?.markPrice || 0);
+          if (mark) usd = Math.abs(amt * mark);
+        }
+        if (!usd) {
+          const px = await getFuturesPrice(symbol);
+          if (px) usd = Math.abs(amt * px);
+        }
+        if (!usd) continue;
+
+        if (usd >= MIN_USD) {
+          altFuturesUSD += usd;
+          altFuturesTop.push({
+            symbol, base,
+            positionSide: pos.positionSide || "BOTH",
+            positionAmt: Number(amt.toFixed(6)),
+            notional: notional ? Number(notional.toFixed(2)) : null,
+            markPrice: pos?.markPrice ? Number(Number(pos.markPrice).toFixed(6)) : null,
+            usd: Number(usd.toFixed(2)),
+          });
+        }
+      }
+      altFuturesTop.sort((a, b) => b.usd - a.usd);
+      altFuturesTop = altFuturesTop.slice(0, 25);
+    }
+
+    // ===== 2) 지갑 ALT(Spot/Funding/Margin/Isolated + Simple Earn) =====
+    const assetUSD = new Map();
     let usedPath = "getUserAsset";
 
-    // 2-1) getUserAsset?needBtcValuation=true (코인별 합계)
+    // 2-1) getUserAsset
     {
-      const ts = Date.now();
-      const qs = new URLSearchParams({ timestamp: String(ts), needBtcValuation: "true" }).toString();
+      const qs = mkQs({ needBtcValuation: "true" });
       const url = `https://api.binance.com/sapi/v3/asset/getUserAsset?${qs}&signature=${sign(secretKey, qs)}`;
       const r = await fetchJson(url, { headers });
       dbg.steps.push({ getUserAsset_status: r.status });
@@ -185,17 +155,15 @@ export default async function handler(req, res) {
           if (usd >= MIN_USD) pushUSD(assetUSD, asset, usd);
         }
       } else {
-        // 2-2) Fallback: Spot/Funding/Margin/Isolated
+        // 2-2) Fallback 체인
         usedPath = "fallback";
 
-        // Spot: capital/config/getall
+        // Spot
         {
-          const ts = Date.now();
-          const qs = new URLSearchParams({ timestamp: String(ts) }).toString();
-          const url = `https://api.binance.com/sapi/v1/capital/config/getall?${qs}&signature=${sign(secretKey, qs)}`;
-          const r2 = await fetchJson(url, { headers });
+          const qs2 = mkQs();
+          const url2 = `https://api.binance.com/sapi/v1/capital/config/getall?${qs2}&signature=${sign(secretKey, qs2)}`;
+          const r2 = await fetchJson(url2, { headers });
           dbg.steps.push({ capital_status: r2.status, count: Array.isArray(r2.json) ? r2.json.length : 0 });
-
           if (r2.ok && Array.isArray(r2.json)) {
             for (const it of r2.json) {
               const asset = it?.coin;
@@ -209,15 +177,12 @@ export default async function handler(req, res) {
             }
           }
         }
-
-        // Funding: get-funding-asset (POST)
+        // Funding
         {
-          const ts = Date.now();
-          const qs = new URLSearchParams({ timestamp: String(ts) }).toString();
-          const url = `https://api.binance.com/sapi/v1/asset/get-funding-asset?${qs}&signature=${sign(secretKey, qs)}`;
-          const r2 = await fetchJson(url, { method: "POST", headers });
+          const qs2 = mkQs();
+          const url2 = `https://api.binance.com/sapi/v1/asset/get-funding-asset?${qs2}&signature=${sign(secretKey, qs2)}`;
+          const r2 = await fetchJson(url2, { method: "POST", headers });
           dbg.steps.push({ funding_status: r2.status, count: Array.isArray(r2.json) ? r2.json.length : 0 });
-
           if (r2.ok && Array.isArray(r2.json)) {
             for (const it of r2.json) {
               const asset = it?.asset;
@@ -231,15 +196,12 @@ export default async function handler(req, res) {
             }
           }
         }
-
         // Cross Margin
         {
-          const ts = Date.now();
-          const qs = new URLSearchParams({ timestamp: String(ts) }).toString();
-          const url = `https://api.binance.com/sapi/v1/margin/account?${qs}&signature=${sign(secretKey, qs)}`;
-          const r2 = await fetchJson(url, { headers });
+          const qs2 = mkQs();
+          const url2 = `https://api.binance.com/sapi/v1/margin/account?${qs2}&signature=${sign(secretKey, qs2)}`;
+          const r2 = await fetchJson(url2, { headers });
           dbg.steps.push({ marginCross_status: r2.status, ok: r2.ok });
-
           if (r2.ok && r2.json?.userAssets && Array.isArray(r2.json.userAssets)) {
             for (const it of r2.json.userAssets) {
               const asset = it?.asset;
@@ -253,15 +215,12 @@ export default async function handler(req, res) {
             }
           }
         }
-
         // Isolated Margin
         {
-          const ts = Date.now();
-          const qs = new URLSearchParams({ symbols: "all", timestamp: String(ts) }).toString();
-          const url = `https://api.binance.com/sapi/v1/margin/isolated/account?${qs}&signature=${sign(secretKey, qs)}`;
-          const r2 = await fetchJson(url, { headers });
+          const qs2 = mkQs({ symbols: "all" });
+          const url2 = `https://api.binance.com/sapi/v1/margin/isolated/account?${qs2}&signature=${sign(secretKey, qs2)}`;
+          const r2 = await fetchJson(url2, { headers });
           dbg.steps.push({ marginIso_status: r2.status, ok: r2.ok });
-
           if (r2.ok && r2.json?.assets && Array.isArray(r2.json.assets)) {
             for (const pair of r2.json.assets) {
               for (const side of ["baseAsset", "quoteAsset"]) {
@@ -281,13 +240,11 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2-3) Simple Earn (유연/고정) 포함
-    // 참고: 권한 없는 계정은 401/403 나올 수 있으므로 try/catch로 무시
+    // 2-3) Simple Earn (Flexible/Locked) 포함
     async function addSimpleEarnPositions() {
-      // 유연
+      // Flexible
       try {
-        const ts = Date.now();
-        const qs = new URLSearchParams({ timestamp: String(ts) }).toString();
+        const qs = mkQs();
         const url = `https://api.binance.com/sapi/v1/simple-earn/flexible/position?${qs}&signature=${sign(secretKey, qs)}`;
         const r = await fetchJson(url, { headers });
         dbg.steps.push({ simpleEarn_flexible_status: r.status, count: Array.isArray(r.json?.rows) ? r.json.rows.length : 0 });
@@ -304,11 +261,9 @@ export default async function handler(req, res) {
           }
         }
       } catch {}
-
-      // 고정
+      // Locked
       try {
-        const ts = Date.now();
-        const qs = new URLSearchParams({ timestamp: String(ts) }).toString();
+        const qs = mkQs();
         const url = `https://api.binance.com/sapi/v1/simple-earn/locked/position?${qs}&signature=${sign(secretKey, qs)}`;
         const r = await fetchJson(url, { headers });
         dbg.steps.push({ simpleEarn_locked_status: r.status, count: Array.isArray(r.json?.rows) ? r.json.rows.length : 0 });
@@ -328,7 +283,7 @@ export default async function handler(req, res) {
     }
     await addSimpleEarnPositions();
 
-    // ----- 합계 및 상위 목록 -----
+    // ----- 합계 -----
     let altWalletUSD = 0;
     let altWalletTop = [];
     for (const [asset, usd] of assetUSD.entries()) {
@@ -339,14 +294,15 @@ export default async function handler(req, res) {
     altWalletTop = altWalletTop.slice(0, 25);
 
     const out = {
+      account: useAcct2 ? "acct2" : "acct1",
       altWalletUSD: Number(altWalletUSD.toFixed(2)),     // 지갑(Spot/Funding/Margin/Isolated + Simple Earn)
       altWalletTop,
-      altFuturesUSD: Number(altFuturesUSD.toFixed(2)),   // USD-M 알트 포지션
+      altFuturesUSD: Number(altFuturesUSD.toFixed(2)),   // USDⓈ-M 알트 포지션
       altFuturesTop,
-      altTotalUSD: Number((altWalletUSD + altFuturesUSD).toFixed(2)), // 지갑 + 선물 합계
+      altTotalUSD: Number((altWalletUSD + altFuturesUSD).toFixed(2)), // 총합
       minUSD: MIN_USD,
       excluded: Array.from(EXCLUDED),
-      path: usedPath,
+      path: "computed",
       t: Date.now()
     };
     if (debugMode) out._debug = dbg;
