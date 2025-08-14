@@ -2,32 +2,45 @@
 import crypto from "crypto";
 
 /**
- * 정확한 "ETH 개수" 집계:
- * - spotETH: SPOT 지갑의 실제 ETH 수량 (free + locked)
- * - fundingETH: Funding 지갑의 실제 ETH 수량
- * - marginCrossETH: Cross Margin의 ETH 순자산(netAsset)
- * - marginIsoETH: (현재 0, 필요 시 isolated 계정 전량 스캔 로직 추가)
+ * ETH 개수 집계(계정 선택 가능):
+ * - Spot: /sapi/v3/asset/getUserAsset (asset=ETH)
+ * - Funding: /sapi/v1/asset/getFundingAsset (asset=ETH)
+ * - Cross Margin: /sapi/v1/margin/account (userAssets[].netAsset for ETH)
+ * - Isolated Margin: (현재 0, 필요시 확장)
+ * - Earn(모두 합산):
+ *   1) Simple Earn Flexible:  /sapi/v1/simple-earn/flexible/position?asset=ETH
+ *   2) Simple Earn Locked:    /sapi/v1/simple-earn/locked/position?asset=ETH
+ *   3) (백업) Lending Union:  /sapi/v1/lending/union/account
+ *   4) (백업) Flexible(Savings): /sapi/v1/lending/daily/token/position?asset=ETH
+ *   5) (백업) Locked(Savings):   /sapi/v1/lending/project/position/list?asset=ETH&type=ALL
  *
- * 선물:
- * - usdM_ETHpos: USDⓈ-M 포지션의 ETH 수량 합(절대값). PM이면 PAPI, 아니면 FAPI.
+ * Futures (USDⓈ-M):
+ * - PM이면 /papi/v1/um/positionRisk, 아니면 /fapi/v2/positionRisk (ETH* 심볼 합산)
  *
- * ENV (Vercel):
- * - BINANCE_API_KEY
- * - BINANCE_SECRET_KEY
+ * ENV:
+ * - 기본: BINANCE_API_KEY / BINANCE_SECRET_KEY
+ * - acct=2: BINANCE2_API_KEY / BINANCE2_SECRET_KEY
  */
 
 export default async function handler(req, res) {
   try {
-    const apiKey = process.env.BINANCE_API_KEY;
-    const secretKey = process.env.BINANCE_SECRET_KEY;
+    // ✅ 계정 선택
+    const useAcct2 = (req.query?.acct === "2");
+    const apiKey    = useAcct2 ? process.env.BINANCE2_API_KEY    : process.env.BINANCE_API_KEY;
+    const secretKey = useAcct2 ? process.env.BINANCE2_SECRET_KEY : process.env.BINANCE_SECRET_KEY;
+
     if (!apiKey || !secretKey) {
       return res.status(500).json({ error: "Missing Binance API credentials" });
     }
 
-    const sign = (q) => crypto.createHmac("sha256", secretKey).update(q).digest("hex");
-    const headers = { "X-MBX-APIKEY": apiKey, "Content-Type": "application/x-www-form-urlencoded" };
     const recv = 60000;
+    const sign = (q) => crypto.createHmac("sha256", secretKey).update(q).digest("hex");
+    const headers = {
+      "X-MBX-APIKEY": apiKey,
+      "Content-Type": "application/x-www-form-urlencoded",
+    };
 
+    // 공용 호출자
     const callGET = async (base, path, paramsObj = {}) => {
       const p = new URLSearchParams({ recvWindow: String(recv), timestamp: String(Date.now()), ...paramsObj });
       const q = p.toString();
@@ -38,7 +51,6 @@ export default async function handler(req, res) {
       let j = null; try { j = JSON.parse(t); } catch {}
       return { ok: r.ok, status: r.status, json: j, text: t, url };
     };
-
     const callPOST = async (base, path, paramsObj = {}) => {
       const p = new URLSearchParams({ recvWindow: String(recv), timestamp: String(Date.now()), ...paramsObj });
       const body = p.toString();
@@ -50,16 +62,18 @@ export default async function handler(req, res) {
       return { ok: r.ok, status: r.status, json: j, text: t, url };
     };
 
-    // ---- 1) SPOT ETH ----
+    // 숫자 파서
+    const num = (v) => {
+      const x = Number(v);
+      return Number.isFinite(x) ? x : 0;
+    };
+
+    // ---- 1) Spot ETH ----
     const spotR = await callPOST("https://api.binance.com", "/sapi/v3/asset/getUserAsset", { asset: "ETH" });
     let spotETH = 0;
     if (Array.isArray(spotR.json)) {
       const row = spotR.json.find((x) => String(x.asset) === "ETH");
-      if (row) {
-        const free = Number(row.free ?? 0);
-        const locked = Number(row.locked ?? 0);
-        spotETH = free + locked;
-      }
+      if (row) spotETH = num(row.free) + num(row.locked);
     }
 
     // ---- 2) Funding ETH ----
@@ -68,10 +82,9 @@ export default async function handler(req, res) {
     if (Array.isArray(fundingR.json)) {
       for (const it of fundingR.json) {
         if (String(it.asset) === "ETH") {
-          const candidates = [it.balance, it.free, it.locked, it.freeze];
-          for (const v of candidates) {
-            const n = Number(v);
-            if (Number.isFinite(n) && n > 0) fundingETH += n;
+          for (const v of [it.balance, it.free, it.locked, it.freeze]) {
+            const vv = num(v);
+            if (vv > 0) fundingETH += vv;
           }
         }
       }
@@ -82,16 +95,62 @@ export default async function handler(req, res) {
     let marginCrossETH = 0;
     if (crossR.json && Array.isArray(crossR.json.userAssets)) {
       const row = crossR.json.userAssets.find((x) => String(x.asset) === "ETH");
-      if (row) {
-        const net = Number(row.netAsset ?? 0);
-        if (Number.isFinite(net)) marginCrossETH = net;
-      }
+      if (row) marginCrossETH = num(row.netAsset);
     }
 
-    // ---- 4) Isolated Margin ETH (지금은 0; 필요시 확장) ----
+    // ---- 4) Isolated Margin ETH (옵션: 현재 0) ----
     let marginIsoETH = 0;
+    // 필요 시 isolated 전체 symbols=all 스캔로 확장 가능
 
-    // ---- 5) USDⓈ-M ETH 포지션 (PM→PAPI, 아니면 FAPI 폴백) ----
+    // ---- 5) Earn ETH (여러 API를 시도해 합산) ----
+    const getEarnETH = async () => {
+      let total = 0;
+
+      // Simple Earn Flexible
+      {
+        const r = await callGET("https://api.binance.com", "/sapi/v1/simple-earn/flexible/position", { asset: "ETH" });
+        if (r.ok && Array.isArray(r.json?.rows || r.json)) {
+          const rows = r.json.rows || r.json;
+          for (const it of rows) total += num(it.totalAmount ?? it.amount ?? it.purchasedAmount);
+        }
+      }
+      // Simple Earn Locked
+      {
+        const r = await callGET("https://api.binance.com", "/sapi/v1/simple-earn/locked/position", { asset: "ETH" });
+        if (r.ok && Array.isArray(r.json?.rows || r.json)) {
+          const rows = r.json.rows || r.json;
+          for (const it of rows) total += num(it.totalAmount ?? it.amount ?? it.purchasedAmount);
+        }
+      }
+      // (백업) Lending Union Account
+      {
+        const r = await callGET("https://api.binance.com", "/sapi/v1/lending/union/account");
+        const list = r.json?.positionAmountVos;
+        if (r.ok && Array.isArray(list)) {
+          for (const it of list) if (String(it?.asset) === "ETH") total += num(it?.amount);
+        }
+      }
+      // (백업) Flexible Savings
+      {
+        const r = await callGET("https://api.binance.com", "/sapi/v1/lending/daily/token/position", { asset: "ETH" });
+        if (r.ok && Array.isArray(r.json)) {
+          for (const it of r.json) total += num(it?.freeAmount) + num(it?.lockedAmount) + num(it?.totalAmount);
+        }
+      }
+      // (백업) Locked Savings
+      {
+        const r = await callGET("https://api.binance.com", "/sapi/v1/lending/project/position/list", { asset: "ETH", type: "ALL" });
+        if (r.ok && Array.isArray(r.json)) {
+          for (const it of r.json) total += num(it?.amount) + num(it?.lotAmount);
+        }
+      }
+
+      return +total.toFixed(8);
+    };
+
+    const earnETH = await getEarnETH();
+
+    // ---- 6) USDⓈ-M ETH 포지션 (PM→PAPI, 아니면 FAPI) ----
     const getUsdmEthPos = async () => {
       const papi = await callGET("https://papi.binance.com", "/papi/v1/um/positionRisk");
       let list = Array.isArray(papi.json) && papi.ok ? papi.json : null;
@@ -103,23 +162,28 @@ export default async function handler(req, res) {
       for (const p of list) {
         const sym = String(p.symbol || "");
         if (!sym.startsWith("ETH")) continue; // ETHUSDT, ETHUSDC 등
-        const amt = Number(p.positionAmt);
-        if (Number.isFinite(amt) && amt !== 0) sum += Math.abs(amt);
+        const amt = num(p.positionAmt);
+        if (amt !== 0) sum += Math.abs(amt);
       }
       return +sum.toFixed(8);
     };
 
     const usdM_ETHpos = await getUsdmEthPos();
 
+    // 합계
+    const walletsTotalETH = +(
+      spotETH + fundingETH + marginCrossETH + marginIsoETH + earnETH
+    ).toFixed(8);
+
     return res.status(200).json({
+      account: useAcct2 ? "acct2" : "acct1",
       spot: {
         spotETH: +spotETH.toFixed(8),
         fundingETH: +fundingETH.toFixed(8),
         marginCrossETH: +marginCrossETH.toFixed(8),
         marginIsoETH: +marginIsoETH.toFixed(8),
-        walletsTotalETH: +(
-          spotETH + fundingETH + marginCrossETH + marginIsoETH
-        ).toFixed(8),
+        earnETH: +earnETH.toFixed(8),           // ✅ Earn 포함
+        walletsTotalETH,                         // ✅ Earn 포함 총합
       },
       futures: { usdM_ETHpos },
       t: Date.now(),
