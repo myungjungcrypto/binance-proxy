@@ -2,133 +2,153 @@
 import crypto from "crypto";
 
 // ----- 설정 -----
-const EXCLUDED = new Set(["BTC", "ETH"]);   // 알트 정의: BTC/ETH 제외
+const EXCLUDED = new Set(["BTC", "ETH"]);   // 알트 = BTC/ETH 제외
 const MIN_USD = 100;                         // $100 이상만 집계
+const TIMEOUT_MS = 3000;
 
-// 공용: 서명/요청
+// 공용: 타임아웃 fetch(JSON 시도)
+async function fetchJson(url, { headers = {}, timeoutMs = TIMEOUT_MS } = {}) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { headers, signal: controller.signal });
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (_) { /* not json */ }
+    return { ok: r.ok, status: r.status, json, text };
+  } catch (err) {
+    return { ok: false, status: 0, error: String(err) };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// 공용: 사인/서명 요청
 function signQS(secret, qs) {
   return crypto.createHmac("sha256", secret).update(qs).digest("hex");
 }
-async function signedFetch(base, path, apiKey, secretKey, params = {}) {
+async function signedFetch(base, path, apiKey, secretKey, params = {}, timeoutMs = TIMEOUT_MS) {
   const query = new URLSearchParams({ timestamp: Date.now(), ...params }).toString();
   const sig = signQS(secretKey, query);
   const url = `${base}${path}?${query}&signature=${sig}`;
-  const r = await fetch(url, { headers: { "X-MBX-APIKEY": apiKey } });
-  const txt = await r.text();
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return { ok: r.ok, status: r.status, json: JSON.parse(txt), raw: txt };
-  } catch {
-    return { ok: false, status: r.status, json: null, raw: txt };
+    const r = await fetch(url, { headers: { "X-MBX-APIKEY": apiKey }, signal: controller.signal });
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (_) { /* not json */ }
+    return { ok: r.ok, status: r.status, json, text };
+  } catch (err) {
+    return { ok: false, status: 0, error: String(err) };
+  } finally {
+    clearTimeout(t);
   }
-}
-async function publicJson(url) {
-  const r = await fetch(url);
-  const t = await r.text();
-  try { return JSON.parse(t); } catch { return null; }
 }
 
 // BTCUSDT 가격 (지갑 BTC평가→USD 전환에 필요)
-async function getBtcUsdt() {
-  // 다중 백업: 바이낸스 → 바이비트 → 코인베이스
-  // (Vercel 싱가포르 리전이면 바이낸스 접근 잘 됩니다)
-  try {
-    const j = await publicJson("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
-    const p = Number(j?.price);
-    if (p > 0) return p;
-  } catch {}
-  try {
-    const j = await publicJson("https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT");
-    const p = Number(j?.result?.list?.[0]?.lastPrice);
-    if (p > 0) return p;
-  } catch {}
-  try {
-    const j = await publicJson("https://api.exchange.coinbase.com/products/BTC-USD/ticker");
-    const p = Number(j?.price ?? j?.last);
-    if (p > 0) return p;
-  } catch {}
+async function getBtcUsdt(debug) {
+  // Binance → Bybit → Coinbase 순
+  {
+    const r = await fetchJson("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
+    debug.prices.push({ source: "binance", ...r, text: undefined });
+    const p = Number(r?.json?.price);
+    if (r.ok && p > 0) return p;
+  }
+  {
+    const r = await fetchJson("https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT");
+    debug.prices.push({ source: "bybit", ok: r.ok, status: r.status, sample: JSON.stringify(r.json)?.slice(0, 200) });
+    const p = Number(r?.json?.result?.list?.[0]?.lastPrice);
+    if (r.ok && p > 0) return p;
+  }
+  {
+    const r = await fetchJson("https://api.exchange.coinbase.com/products/BTC-USD/ticker");
+    debug.prices.push({ source: "coinbase", ok: r.ok, status: r.status, sample: r.text?.slice(0, 200) });
+    const p = Number(r?.json?.price ?? r?.json?.last);
+    if (r.ok && p > 0) return p;
+  }
   return 0;
 }
 
 // 지갑(현물/마진/펀딩 등) 알트 총액 USD 계산
-async function getAltWalletUSD(apiKey, secretKey) {
-  // /sapi/v3/asset/getUserAsset?needBtcValuation=true 로 코인별 보유 & BTC평가액 제공
-  const { ok, json, raw } = await signedFetch(
+async function getAltWalletUSD(apiKey, secretKey, debug) {
+  const r = await signedFetch(
     "https://api.binance.com",
     "/sapi/v3/asset/getUserAsset",
     apiKey,
     secretKey,
     { needBtcValuation: true }
   );
-  if (!ok || !Array.isArray(json)) {
-    return { totalUSD: 0, items: [], debug: raw ?? json };
+  debug.wallet.push({ step: "getUserAsset", ok: r.ok, status: r.status, sample: r.text?.slice(0, 200) });
+
+  if (!r.ok || !Array.isArray(r.json)) {
+    return { totalUSD: 0, items: [], reason: "wallet_fetch_failed" };
   }
 
-  const btcUsdt = await getBtcUsdt();
-  if (!btcUsdt) return { totalUSD: 0, items: [], debug: "No BTCUSDT price" };
+  const btcUsdt = await getBtcUsdt(debug);
+  if (!btcUsdt) return { totalUSD: 0, items: [], reason: "no_btcusdt_price" };
 
   let totalUSD = 0;
   const items = [];
 
-  for (const a of json) {
-    const asset = a.asset?.toUpperCase?.() || "";
+  for (const a of r.json) {
+    const asset = (a.asset || "").toUpperCase();
     if (!asset || EXCLUDED.has(asset)) continue;
 
-    // 총 수량 (free + locked)
+    // 총 수량
     const qty =
       (Number(a.free) || 0) +
       (Number(a.locked) || 0) +
       (Number(a.freeze) || 0) +
       (Number(a.withdrawing) || 0);
 
-    // Binance가 제공하는 btcValuation 사용 → USD 변환
+    // BTC 평가액 → USD
     const btcVal = Number(a.btcValuation) || 0;
     const usd = btcVal * btcUsdt;
 
     if (qty > 0 && usd >= MIN_USD) {
-      items.push({ asset, qty, usd: Number(usd.toFixed(2)) });
+      items.push({ asset, qty: Number(qty.toFixed(8)), usd: Number(usd.toFixed(2)) });
       totalUSD += usd;
     }
   }
 
-  // 큰 금액 우선 나열
   items.sort((x, y) => y.usd - x.usd);
   return { totalUSD: Number(totalUSD.toFixed(2)), items };
 }
 
-// USD‑M 선물 알트 포지션 총액 USD 계산 (노출 금액 기준: |수량| * markPrice)
-async function getAltFuturesUSD(apiKey, secretKey) {
-  const { ok, json, raw } = await signedFetch(
+// USD‑M 선물 알트 포지션 총액 USD 계산 (|수량| * markPrice)
+async function getAltFuturesUSD(apiKey, secretKey, debug) {
+  const r = await signedFetch(
     "https://fapi.binance.com",
     "/fapi/v2/positionRisk",
     apiKey,
     secretKey
   );
-  if (!ok || !Array.isArray(json)) {
-    return { totalUSD: 0, items: [], debug: raw ?? json };
+  debug.futures.push({ step: "positionRisk", ok: r.ok, status: r.status, sample: r.text?.slice(0, 200) });
+
+  if (!r.ok || !Array.isArray(r.json)) {
+    return { totalUSD: 0, items: [], reason: "futures_fetch_failed" };
   }
 
-  let totalUSD = 0;
-  const itemsMap = new Map(); // 심볼별 합산
-
-  for (const p of json) {
+  const map = new Map();
+  for (const p of r.json) {
     const amt = Number(p.positionAmt) || 0;
     if (amt === 0) continue;
 
     const symbol = String(p.symbol || "");
-    // 심볼에서 코인 티커 추출 (예: ARBUSDT → ARB, DOGEUSDT → DOGE)
-    let base = symbol.endsWith("USDT") ? symbol.replace("USDT", "") : symbol;
+    let base = symbol.endsWith("USDT") ? symbol.slice(0, -5) : symbol; // e.g. ARBUSDT -> ARB
     base = base.toUpperCase();
 
     if (EXCLUDED.has(base)) continue;
 
     const usd = Math.abs(amt * (Number(p.markPrice) || 0));
     if (usd >= MIN_USD) {
-      const prev = itemsMap.get(base) || 0;
-      itemsMap.set(base, prev + usd);
+      map.set(base, (map.get(base) || 0) + usd);
     }
   }
 
-  const items = Array.from(itemsMap.entries())
+  const items = Array.from(map.entries())
     .map(([asset, usd]) => ({ asset, usd: Number(usd.toFixed(2)) }))
     .sort((a, b) => b.usd - a.usd);
 
@@ -137,6 +157,9 @@ async function getAltFuturesUSD(apiKey, secretKey) {
 }
 
 export default async function handler(req, res) {
+  const debug = { prices: [], wallet: [], futures: [] };
+  const wantDebug = (req?.query?.debug === "1") || (new URL(req.url, "http://x").searchParams.get("debug") === "1");
+
   try {
     const apiKey = process.env.BINANCE_API_KEY;
     const secretKey = process.env.BINANCE_SECRET_KEY;
@@ -144,24 +167,26 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing Binance API credentials" });
     }
 
-    // 동시 실행
     const [wallet, futures] = await Promise.all([
-      getAltWalletUSD(apiKey, secretKey),
-      getAltFuturesUSD(apiKey, secretKey),
+      getAltWalletUSD(apiKey, secretKey, debug),
+      getAltFuturesUSD(apiKey, secretKey, debug),
     ]);
 
-    return res.status(200).json({
+    const payload = {
       altWalletUSD: wallet.totalUSD,
-      altWalletTop: wallet.items.slice(0, 20), // 상위 20개만 노출
+      altWalletTop: wallet.items?.slice(0, 20) || [],
       altFuturesUSD: futures.totalUSD,
-      altFuturesTop: futures.items.slice(0, 20),
+      altFuturesTop: futures.items?.slice(0, 20) || [],
       minUSD: MIN_USD,
       excluded: Array.from(EXCLUDED),
       t: Date.now(),
-      // 필요 시 내부 디버그 확인:
-      // debug: { wallet: wallet.debug, futures: futures.debug }
-    });
+    };
+    if (wantDebug) payload.debug = debug;
+
+    return res.status(200).json(payload);
   } catch (e) {
-    return res.status(500).json({ error: e.message || String(e) });
+    // 절대 크래시하지 않도록
+    const msg = e?.message || String(e);
+    return res.status(500).json({ error: "UnhandledError", message: msg, t: Date.now(), debug: wantDebug ? debug : undefined });
   }
 }
