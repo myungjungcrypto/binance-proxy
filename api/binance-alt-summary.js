@@ -66,37 +66,63 @@ export default async function handler(req, res) {
     }
     dbg.steps.push({ spotPricePairs: tickAll.json.length });
 
-    // ----- 1) 선물 USD-M 포지션 합계 (ALT만) -----
+ // ----- 1) 선물 USD-M 포지션 합계 (ALT만) -----
 let altFuturesUSD = 0;
 let altFuturesTop = [];
 {
   const qs = new URLSearchParams({ timestamp: String(ts) }).toString();
   const url = `https://fapi.binance.com/fapi/v2/positionRisk?${qs}&signature=${sign(secretKey, qs)}`;
   const r = await fetchJson(url, { headers });
-  dbg.steps.push({ fapi_status: r.status, count: Array.isArray(r.json) ? r.json.length : 0 });
+
+  // 디버그용: 상태와 포지션 개수 확인
+  dbg.steps.push({ fapi_status: r.status, positions: Array.isArray(r.json) ? r.json.length : null });
 
   if (r.ok && Array.isArray(r.json)) {
-    // 사용자는 USDT 마켓만이라고 하셨으니 USDT만 필터(원하시면 USDC/FDUSD/BUSD 추가 가능)
-    const QUOTES = ["USDT"]; // 필요 시 ["USDT","USDC","FDUSD","BUSD"]
+    // 사용자는 USDT 마켓이라고 했으므로 USDT만 허용 (필요시 USDC/FDUSD/BUSD 추가)
+    const QUOTES = ["USDT"];
+    // 선물에서는 알트 정의: BTC/ETH만 제외 (USDT/USDC는 제외 대상 아님)
+    const FUTURES_EXCLUDED_BASE = new Set(["BTC", "ETH"]);
+
+    // 개별 심볼 가격 폴백용 캐시
+    const priceCache = new Map();
+    async function getFuturesPrice(symbol) {
+      if (priceCache.has(symbol)) return priceCache.get(symbol);
+      const pr = await fetchJson(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, { headers });
+      const px = pr.ok ? Number(pr.json?.price) : 0;
+      priceCache.set(symbol, px || 0);
+      return px || 0;
+    }
 
     for (const pos of r.json) {
-      const amt = toNum(pos.positionAmt);
-      if (!amt) continue;
+      const amt = Number(pos?.positionAmt || 0);
+      if (!amt) continue; // 포지션 없음
 
-      const symbol = String(pos.symbol || "");
-      if (!QUOTES.some(q => symbol.endsWith(q))) continue;
+      const symbol = String(pos?.symbol || "");
+      if (!QUOTES.some(q => symbol.endsWith(q))) continue; // USDT 마켓만
+      const base = baseAssetFromSymbol(symbol);            // 예: ARBUSDT -> ARB
+      if (FUTURES_EXCLUDED_BASE.has(base)) continue;       // BTC/ETH 제외 (알트만)
 
-      // 기초자산 추출 (예: ARBUSDT -> ARB)
-      const base = baseAssetFromSymbol(symbol);
-      if (EXCLUDED.has(base)) continue; // BTC/ETH/USDT/USDC 제외(알트만)
+      // notional(USDT 기준)을 1순위로 사용
+      const notional = Number(pos?.notional || 0);
+      let usd = Math.abs(notional);
 
-      // ✅ notional(USDT 단위)이 제일 신뢰도 높음 → 1순위!
-      const notional = toNum(pos.notional);
-      const mark = toNum(pos.markPrice);
+      if (!usd) {
+        // markPrice 폴백
+        const mark = Number(pos?.markPrice || 0);
+        if (mark) usd = Math.abs(amt * mark);
+      }
+      if (!usd) {
+        // 둘 다 0이면, 심볼 가격 API 폴백
+        const px = await getFuturesPrice(symbol); // USDT 기준 가격
+        if (px) usd = Math.abs(amt * px);
+      }
 
-      // notional이 있으면 그걸 쓰고, 없으면 mark*qty로 폴백
-      const usd = Math.abs(notional || (amt * mark));
-      if (!usd) continue;
+      if (!usd) {
+        // 디버그: 왜 제외됐는지 남겨두기
+        dbg.filtered = dbg.filtered || [];
+        dbg.filtered.push({ symbol, base, amt, notional, mark: Number(pos?.markPrice || 0), reason: "zero_usd" });
+        continue;
+      }
 
       if (usd >= MIN_USD) {
         altFuturesUSD += usd;
@@ -104,8 +130,8 @@ let altFuturesTop = [];
           symbol, base,
           positionSide: pos.positionSide || "BOTH",
           positionAmt: Number(amt.toFixed(6)),
-          markPrice: mark ? Number(mark.toFixed(6)) : null,
           notional: notional ? Number(notional.toFixed(2)) : null,
+          markPrice: pos?.markPrice ? Number(Number(pos.markPrice).toFixed(6)) : null,
           usd: Number(usd.toFixed(2)),
         });
       }
