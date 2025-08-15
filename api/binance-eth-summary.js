@@ -15,7 +15,8 @@ import crypto from "crypto";
  *   5) (백업) Locked(Savings):   /sapi/v1/lending/project/position/list?asset=ETH&type=ALL
  *
  * Futures (USDⓈ-M):
- * - PM이면 /papi/v1/um/positionRisk, 아니면 /fapi/v2/positionRisk (ETH* 심볼 합산)
+ * - PM이면 /papi/v1/um/positionRisk, 아니면 /fapi/v2/positionRisk
+ * - ✅ 선물 수량은 절대값 합이 아니라 "순 수량(net)"(롱−숏)을 합산하여 반환(usdM_ETHnetQty)
  *
  * ENV:
  * - 기본: BINANCE_API_KEY / BINANCE_SECRET_KEY
@@ -150,25 +151,26 @@ export default async function handler(req, res) {
 
     const earnETH = await getEarnETH();
 
-    // ---- 6) USDⓈ-M ETH 포지션 (PM→PAPI, 아니면 FAPI) ----
-    const getUsdmEthPos = async () => {
+    // ---- 6) USDⓈ-M ETH 포지션 (순 수량 NET 합산) ----
+    const getUsdmEthNetQty = async () => {
+      // PM(포트폴리오) 우선 → 실패 시 FAPI
       const papi = await callGET("https://papi.binance.com", "/papi/v1/um/positionRisk");
       let list = Array.isArray(papi.json) && papi.ok ? papi.json : null;
       if (!list) {
         const fapi = await callGET("https://fapi.binance.com", "/fapi/v2/positionRisk");
         list = Array.isArray(fapi.json) && fapi.ok ? fapi.json : [];
       }
-      let sum = 0;
+      let net = 0; // 롱(+) − 숏(−)의 순 합
       for (const p of list) {
         const sym = String(p.symbol || "");
         if (!sym.startsWith("ETH")) continue; // ETHUSDT, ETHUSDC 등
         const amt = num(p.positionAmt);
-        if (amt !== 0) sum += Math.abs(amt);
+        if (amt !== 0) net += amt; // 절대값 금지: 순 수량
       }
-      return +sum.toFixed(8);
+      return +net.toFixed(8);
     };
 
-    const usdM_ETHpos = await getUsdmEthPos();
+    const usdM_ETHnetQty = await getUsdmEthNetQty();
 
     // 합계
     const walletsTotalETH = +(
@@ -182,10 +184,10 @@ export default async function handler(req, res) {
         fundingETH: +fundingETH.toFixed(8),
         marginCrossETH: +marginCrossETH.toFixed(8),
         marginIsoETH: +marginIsoETH.toFixed(8),
-        earnETH: +earnETH.toFixed(8),           // ✅ Earn 포함
-        walletsTotalETH,                         // ✅ Earn 포함 총합
+        earnETH: +earnETH.toFixed(8),
+        walletsTotalETH,
       },
-      futures: { usdM_ETHpos },
+      futures: { usdM_ETHnetQty }, // ✅ 순 수량(net)
       t: Date.now(),
     });
   } catch (e) {
