@@ -55,82 +55,89 @@ export default async function handler(req, res) {
     }
     dbg.steps.push({ spotPricePairs: tickAll.json.length });
 
-    // ===== 1) USDⓈ-M 선물 ALT 포지션(USDT 마켓, BTC/ETH 제외) =====
-    let altFuturesUSD = 0;
-    let altFuturesTop = [];
+   // ===== 1) USDⓈ-M 선물 ALT 포지션(USDT 마켓, BTC/ETH 제외) =====
+let altFuturesUSD = 0;
+let altFuturesTop = [];
 
-    const recvWindow = 5000;
-    const mkQs = (extra={}) => new URLSearchParams({
-      timestamp: String(Date.now()),
-      recvWindow: String(recvWindow),
-      ...extra
-    }).toString();
+const recvWindow = 5000;
+const mkQs = (extra={}) => new URLSearchParams({
+  timestamp: String(Date.now()),
+  recvWindow: String(recvWindow),
+  ...extra
+}).toString();
 
-    // 우선 FAPI → 실패 시 PAPI (Unified/PM)
-    let posRes = await fetchJson(
-      `https://fapi.binance.com/fapi/v2/positionRisk?${mkQs()}` +
-      `&signature=${sign(secretKey, mkQs())}`,
-      { headers }
-    );
-    if (!posRes.ok) {
-      const qs = mkQs();
-      const url = `https://papi.binance.com/papi/v1/um/positionRisk?${qs}&signature=${sign(secretKey, qs)}`;
-      const rp = await fetchJson(url, { headers });
-      dbg.steps.push({ futuresFetch: { fapi: { status: posRes.status, textSample: posRes.text?.slice(0,120) }, papi: { status: rp.status, textSample: rp.text?.slice(0,120) } }});
-      if (rp.ok) posRes = rp;
+// FAPI → 실패시 PAPI
+let posRes = await fetchJson(
+  (() => { const qs = mkQs(); return `https://fapi.binance.com/fapi/v2/positionRisk?${qs}&signature=${sign(secretKey, qs)}`; })(),
+  { headers }
+);
+if (!posRes.ok) {
+  const qs = mkQs();
+  const url = `https://papi.binance.com/papi/v1/um/positionRisk?${qs}&signature=${sign(secretKey, qs)}`;
+  const rp = await fetchJson(url, { headers });
+  dbg.steps.push({ futuresFetch: { fapi: { status: posRes.status, textSample: posRes.text?.slice(0,120) }, papi: { status: rp.status, textSample: rp.text?.slice(0,120) } }});
+  if (rp.ok) posRes = rp;
+} else {
+  dbg.steps.push({ futuresFetch: { fapi: { status: posRes.status, textSample: posRes.text?.slice(0,120) } }});
+}
+
+if (posRes.ok && Array.isArray(posRes.json)) {
+  const QUOTES = ["USDT"]; // USDT 마켓만
+  const FUTURES_EXCLUDED_BASE = new Set(["BTC", "ETH"]);
+
+  const priceCache = new Map();
+  async function getFuturesPrice(symbol) {
+    if (priceCache.has(symbol)) return priceCache.get(symbol);
+    const pr = await fetchJson(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, { headers });
+    const px = pr.ok ? Number(pr.json?.price) : 0;
+    priceCache.set(symbol, px || 0);
+    return px || 0;
+  }
+
+  for (const pos of posRes.json) {
+    const amt = Number(pos?.positionAmt || 0);
+    if (!amt) continue;
+
+    const symbol = String(pos?.symbol || "");
+    if (!QUOTES.some(q => symbol.endsWith(q))) continue;     // USDT만
+    const base = baseAssetFromSymbol(symbol);
+    if (FUTURES_EXCLUDED_BASE.has(base)) continue;           // BTC/ETH 제외
+
+    // ✅ 부호 유지한 USD 계산
+    let usd = 0;
+    const notional = Number(pos?.notional);
+    if (Number.isFinite(notional) && notional !== 0) {
+      usd = notional; // 이미 부호 포함 (숏이면 음수)
     } else {
-      dbg.steps.push({ futuresFetch: { fapi: { status: posRes.status, textSample: posRes.text?.slice(0,120) } }});
-    }
-
-    if (posRes.ok && Array.isArray(posRes.json)) {
-      const QUOTES = ["USDT"]; // USDT 마켓만
-      const FUTURES_EXCLUDED_BASE = new Set(["BTC", "ETH"]);
-
-      const priceCache = new Map();
-      async function getFuturesPrice(symbol) {
-        if (priceCache.has(symbol)) return priceCache.get(symbol);
-        const pr = await fetchJson(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, { headers });
-        const px = pr.ok ? Number(pr.json?.price) : 0;
-        priceCache.set(symbol, px || 0);
-        return px || 0;
+      const mark = Number(pos?.markPrice || 0);
+      if (mark) {
+        usd = amt * mark; // amt에 부호 포함
+      } else {
+        const px = await getFuturesPrice(symbol);
+        if (px) usd = amt * px; // amt에 부호 포함
       }
-
-      for (const pos of posRes.json) {
-        const amt = Number(pos?.positionAmt || 0);
-        if (!amt) continue;
-
-        const symbol = String(pos?.symbol || "");
-        if (!QUOTES.some(q => symbol.endsWith(q))) continue;
-        const base = baseAssetFromSymbol(symbol);
-        if (FUTURES_EXCLUDED_BASE.has(base)) continue;
-
-        const notional = Number(pos?.notional || 0);
-        let usd = Math.abs(notional);
-        if (!usd) {
-          const mark = Number(pos?.markPrice || 0);
-          if (mark) usd = Math.abs(amt * mark);
-        }
-        if (!usd) {
-          const px = await getFuturesPrice(symbol);
-          if (px) usd = Math.abs(amt * px);
-        }
-        if (!usd) continue;
-
-        if (usd >= MIN_USD) {
-          altFuturesUSD += usd;
-          altFuturesTop.push({
-            symbol, base,
-            positionSide: pos.positionSide || "BOTH",
-            positionAmt: Number(amt.toFixed(6)),
-            notional: notional ? Number(notional.toFixed(2)) : null,
-            markPrice: pos?.markPrice ? Number(Number(pos.markPrice).toFixed(6)) : null,
-            usd: Number(usd.toFixed(2)),
-          });
-        }
-      }
-      altFuturesTop.sort((a, b) => b.usd - a.usd);
-      altFuturesTop = altFuturesTop.slice(0, 25);
     }
+    if (!usd) continue;
+
+    // 100달러 이상(절대값)만 표기/합산
+    if (Math.abs(usd) >= MIN_USD) {
+      altFuturesUSD += usd; // ✅ 순가치로 합산
+      altFuturesTop.push({
+        symbol, base,
+        positionSide: pos.positionSide || "BOTH",
+        positionAmt: Number(amt.toFixed(6)),
+        notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : null,
+        markPrice: pos?.markPrice ? Number(Number(pos.markPrice).toFixed(6)) : null,
+        usd: Number(usd.toFixed(2)),         // 부호 유지
+        direction: usd > 0 ? "LONG" : "SHORT"
+      });
+    }
+  }
+
+  // 정렬은 순가치 기준(롱 큰 순 → 숏은 아래로)
+  altFuturesTop.sort((a, b) => b.usd - a.usd);
+  altFuturesTop = altFuturesTop.slice(0, 25);
+}
 
     // ===== 2) 지갑 ALT(Spot/Funding/Margin/Isolated + Simple Earn) =====
     const assetUSD = new Map();
