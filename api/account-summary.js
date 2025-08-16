@@ -55,10 +55,10 @@ export default async function handler(req, res) {
     const breakdown = [];
     for (const w of balJson) {
       const v = Number(w?.balance) || 0;
-      if (v > 0) {
+  
         totalBTC += v;
         breakdown.push({ wallet: w.walletName, balance: w.balance });
-      }
+
     }
 
     const totalUSD = Number((totalBTC * btcPrice).toFixed(2));
