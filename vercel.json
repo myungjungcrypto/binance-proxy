@@ -1,9 +1,13 @@
 {
   "version": 2,
-  "regions": ["sin1"],
   "functions": {
     "api/**/*.js": {
-      "runtime": "@vercel/node@2.15.10"
+      "runtime": "nodejs22.x",
+      "memory": 256,
+      "maxDuration": 10
     }
-  }
+  },
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/$1" }
+  ]
 }

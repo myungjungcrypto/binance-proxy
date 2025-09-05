@@ -1,25 +1,8 @@
 {
-  "name": "my-binance-project",
+  "name": "binance-proxy",
   "version": "1.0.0",
-  "description": "Binance API proxy for Google Sheets via Vercel",
-  "main": "index.js",
-  "type": "module",
+  "private": true,
   "engines": {
-    "node": "18.x"
-  },
-  "scripts": {
-    "start": "node api/binance.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/myungjungcrypto/binance-proxy.git"
-  },
-  "keywords": ["binance", "proxy", "vercel", "google-sheets"],
-  "author": "myungjungcrypto",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/myungjungcrypto/binance-proxy/issues"
-  },
-  "homepage": "https://github.com/myungjungcrypto/binance-proxy#readme"
+    "node": "22.x"
+  }
 }
