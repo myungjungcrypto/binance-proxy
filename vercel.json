@@ -1,14 +1,10 @@
 {
   "version": 2,
   "functions": {
-    "api/**/*.js": {
-      "runtime": "nodejs22.x"
+    "api/*.js": {
+      "runtime": "nodejs22.x",
+      "memory": 1024,
+      "maxDuration": 15
     }
-  },
-  "crons": [
-    {
-      "path": "/api/xpl-ticker",
-      "schedule": "* * * * *"
-    }
-  ]
+  }
 }
