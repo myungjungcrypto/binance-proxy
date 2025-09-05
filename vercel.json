@@ -1,9 +1,4 @@
 {
   "version": 2,
-  "regions": ["sin1"],
-  "functions": {
-    "api/**/*.js": {
-      "runtime": "nodejs22.x"
-    }
-  }
+  "regions": ["sin1"]
 }
