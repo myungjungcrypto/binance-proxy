@@ -2,7 +2,5 @@
   "name": "binance-proxy",
   "version": "1.0.0",
   "private": true,
-  "engines": {
-    "node": "22.x"
-  }
+  "engines": { "node": "22.x" }
 }
