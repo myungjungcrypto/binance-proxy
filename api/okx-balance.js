@@ -1,189 +1,191 @@
 // api/okx-balance.js
 import crypto from "crypto";
 
-const OKX_BASE = "https://www.okx.com";
-
-function okxSign(timestamp, method, path, query = "", body = "", secret) {
-  const prehash = timestamp + method.toUpperCase() + path + (query || "") + (body || "");
-  return crypto.createHmac("sha256", secret).update(prehash).digest("base64");
+// ---- OKX 서명/호출 유틸 ----
+function sign(message, secret) {
+  return crypto.createHmac("sha256", secret).update(message).digest("base64");
 }
 
-async function okxFetch({ path, method = "GET", query = "", bodyObj = null, creds }) {
-  const ts = new Date().toISOString();
-  const body = bodyObj ? JSON.stringify(bodyObj) : "";
-  const sig = okxSign(ts, method, path, query, body, creds.secret);
+function isoTime() {
+  return new Date().toISOString();
+}
 
-  const url = OKX_BASE + path + (query || "");
+async function okxGet(path, params, { key, secret, passphrase }) {
+  const qs = params
+    ? "?" +
+      Object.entries(params)
+        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+        .join("&")
+    : "";
+  const url = `https://www.okx.com${path}${qs}`;
+
+  const ts = isoTime();
+  const prehash = ts + "GET" + path + (qs || "");
+  const signature = sign(prehash, secret);
+
   const r = await fetch(url, {
-    method,
+    method: "GET",
     headers: {
-      "OK-ACCESS-KEY": creds.key,
-      "OK-ACCESS-SIGN": sig,
+      "OK-ACCESS-KEY": key,
+      "OK-ACCESS-SIGN": signature,
       "OK-ACCESS-TIMESTAMP": ts,
-      "OK-ACCESS-PASSPHRASE": creds.passphrase,
-      "OK-ACCESS-PROJECT": "",       // 필요없음
-      "Content-Type": "application/json",
-      "x-simulated-trading": "0"
+      "OK-ACCESS-PASSPHRASE": passphrase,
     },
-    body: body || undefined
   });
 
-  const text = await r.text();
+  const rawText = await r.text();
   let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  try { json = JSON.parse(rawText); } catch { /* noop */ }
 
-  return { ok: r.ok, status: r.status, json };
-}
-
-function sumUSD(list, picker) {
-  let s = 0;
-  for (const it of list) {
-    const v = picker(it);
-    const n = Number(v);
-    if (Number.isFinite(n)) s += n;
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${path}: ${rawText}`);
+  if (!json || json.code !== "0") {
+    throw new Error(`OKX ${path} error: code=${json?.code} msg=${json?.msg || rawText}`);
   }
-  return s;
+  return json.data || [];
 }
 
+// ---- 개별 호출 ----
+// 1) 계정 모드 확인 (Simple / Portfolio / Advanced)
+async function fetchAccountConfig(auth) {
+  const data = await okxGet("/api/v5/account/config", null, auth);
+  const cfg = data[0] || {};
+  // acctLv: 1(Simple), 2(Portfolio), 3(Portfolio Margin), 4(Simplified?), 5(Enhanced / Advanced)
+  // mgnMode: cross/isolated, posMode 등
+  return {
+    acctLv: cfg.acctLv,
+    mgnMode: cfg.mgnMode,
+    uid: cfg.uid,
+  };
+}
+
+// 2) Trading(=Trade 계정, 기존 spot/margin/derivatives) 잔고 요약 (USD)
+//    OKX는 /account/asset-valuation 으로 USD 평가액을 바로 줍니다.
+async function fetchTradingValuationUSD(auth) {
+  const data = await okxGet("/api/v5/account/asset-valuation", { ccy: "USD" }, auth);
+  // data[0].totalBal 는 계정 총 평가액(USD 기준)
+  const t = data[0] || {};
+  const v = Number(t.totalBal || "0");
+  return Number.isFinite(v) ? v : 0;
+}
+
+// 3) 지갑별 상세(코인별 USD) — 상위 코인 브레이크다운용
+async function fetchAssetBalances(auth) {
+  const list = await okxGet("/api/v5/asset/balances", null, auth);
+  // 각 항목: { ccy, bal, availBal, frozenBal, ... , usdVal }
+  return list.map((x) => ({
+    ccy: x.ccy,
+    usd: Number(x.usdVal || "0"),
+  }));
+}
+
+// 4) Earn - Savings(유동성 저축) 잔고 (USDT 위주 집계)
+//    공식 엔드포인트: /api/v5/finance/savings/balance
+//    - 계정 권한/리전에 따라 404가 날 수 있어 try/catch 후 0 처리
+async function fetchSavingsUSDT(auth) {
+  try {
+    const data = await okxGet("/api/v5/finance/savings/balance", null, auth);
+    // 예시 항목: { ccy: 'USDT', amt: '17800', rate: '...' ... }
+    let usdt = 0;
+    for (const it of data) {
+      if ((it.ccy || "").toUpperCase() === "USDT") {
+        const amt = Number(it.amt || "0");
+        if (Number.isFinite(amt)) usdt += amt;
+      }
+    }
+    return usdt; // USDT 수량 == USD
+  } catch {
+    return 0;
+  }
+}
+
+// 5) Earn - DeFi Staking/On-chain Earn (USDT 위주)
+//    엔드포인트는 계정 상태에 따라 다를 수 있어 두 가지 경로 시도 후 실패 시 0 처리
+async function fetchDefiUSDT(auth) {
+  // 후보 1
+  try {
+    const data = await okxGet("/api/v5/finance/staking-defi/positions", null, auth);
+    let usdt = 0;
+    for (const it of data) {
+      if ((it.ccy || "").toUpperCase() === "USDT") {
+        const amt = Number(it.amt || it.investAmt || "0");
+        if (Number.isFinite(amt)) usdt += amt;
+      }
+    }
+    if (usdt > 0) return usdt;
+  } catch { /* try alt */ }
+
+  // 후보 2 (활성 주문 목록)
+  try {
+    const data = await okxGet("/api/v5/finance/staking-defi/orders-active", null, auth);
+    let usdt = 0;
+    for (const it of data) {
+      if ((it.ccy || "").toUpperCase() === "USDT") {
+        const amt = Number(it.amt || it.investAmt || "0");
+        if (Number.isFinite(amt)) usdt += amt;
+      }
+    }
+    return usdt;
+  } catch {
+    return 0;
+  }
+}
+
+// ---- 핸들러 ----
 export default async function handler(req, res) {
   try {
     const key = process.env.OKX_API_KEY;
     const secret = process.env.OKX_API_SECRET;
     const passphrase = process.env.OKX_API_PASSPHRASE;
+
     if (!key || !secret || !passphrase) {
-      return res.status(400).json({ ok: false, error: "Missing OKX API credentials" });
-    }
-    const debugMode = req.query.debug === "1" || req.query.debug === "true";
-
-    const creds = { key, secret, passphrase };
-    const debug = { steps: [] };
-
-    // 1) 계정 모드 확인 (Advanced / Multi-Currency)
-    const acct = await okxFetch({
-      path: "/api/v5/account/config",
-      creds
-    });
-    debug.steps.push({ step: "account/config", status: acct.status, data: acct.json });
-    const mode = (() => {
-      const r = acct.json?.data?.[0];
-      if (!r) return "Unknown";
-      // acctLevel=2 가 Advanced, posMode 등 참고용
-      return (r.acctLv === "2" ? "Advanced" : "Simple") + " / " + (r.multiCcyMargin === "true" ? "Multi-Currency" : "Single-Currency");
-    })();
-
-    // 2) Trading/Portfolio 잔고 (계정 총 평가액)
-    // okx v5: /api/v5/account/balance  (eqUsd 제공)
-    const accountBal = await okxFetch({
-      path: "/api/v5/account/balance",
-      creds
-    });
-    debug.steps.push({ step: "account/balance", status: accountBal.status, data: accountBal.json });
-
-    let tradingUSD = 0;
-    let coinsFromAccount = [];
-    if (accountBal.ok && accountBal.json?.data?.[0]) {
-      const d = accountBal.json.data[0];
-      tradingUSD = Number(d?.totalEq) || 0; // 총 평가(USD 등가). OKX는 통화기준 eq 필드가 있을 수 있음
-      // 코인별 브레이크다운: eqUsd가 없으면 eq(기준자산 등가)만 있을 수 있어 보조적으로 사용
-      coinsFromAccount = Array.isArray(d.details) ? d.details.map(it => ({
-        ccy: it.ccy,
-        usd: Number(it.eqUsd ?? it.eq ?? 0)
-      })) : [];
+      return res.status(500).json({ ok: false, error: "Missing OKX API credentials" });
     }
 
-    // 3) Funding(자금) 지갑
-    // /api/v5/asset/balances  -> 각 코인의 bal, availBal, frozenBal, eqUsd
-    const funding = await okxFetch({
-      path: "/api/v5/asset/balances",
-      creds
-    });
-    debug.steps.push({ step: "asset/balances", status: funding.status, data: funding.json });
+    const auth = { key, secret, passphrase };
+    const cfg = await fetchAccountConfig(auth);
 
-    let fundingUSD = 0;
-    let coinsFromFunding = [];
-    if (funding.ok && Array.isArray(funding.json?.data)) {
-      coinsFromFunding = funding.json.data.map(x => ({
-        ccy: x.ccy,
-        usd: Number(x.eqUsd ?? 0),
-      }));
-      fundingUSD = sumUSD(coinsFromFunding, it => it.usd);
-    }
+    // Trading(거래/파생/현물) 총 USD 평가액
+    const tradingUSD = await fetchTradingValuationUSD(auth);
 
-    // 4) Savings(간단 예치) 잔고
-    // /api/v5/finance/savings/balance  -> data: [{ccy, amt, earn, ...}] (eqUsd가 직접 없으면 환율필드가 없어서 USD 합산은 불가할 수도)
-    // 여기서는 USD 환산이 없는 경우, 일단 건수/원시 데이터만 참고하거나 코인만 추려둔다.
-    let savingsUSD = 0;
-    let coinsFromSavings = [];
-    const savings = await okxFetch({
-      path: "/api/v5/finance/savings/balance",
-      creds
-    });
-    debug.steps.push({ step: "finance/savings/balance", status: savings.status, data: savings.json });
-
-    if (savings.ok && Array.isArray(savings.json?.data)) {
-      // savings API는 통상 USD 환산을 직접 주지 않는다. 보수적으로 0으로 두고 코인 목록만 참고.
-      coinsFromSavings = savings.json.data.map(x => ({ ccy: x.ccy, amt: Number(x.amt ?? 0) }));
-      // 원한다면 가격 오라클 붙여 USD 환산 가능(추후 확장)
-    }
-
-    // 5) Staking/DeFi(락업형) 활성 포지션
-    // 올바른 엔드포인트: /api/v5/finance/staking-defi/orders-active
-    let defiUSD = 0;
-    let coinsFromDefi = [];
-    const defi = await okxFetch({
-      path: "/api/v5/finance/staking-defi/orders-active",
-      creds
-    });
-    debug.steps.push({ step: "finance/staking-defi/orders-active", status: defi.status, data: defi.json });
-
-    if (defi.ok && Array.isArray(defi.json?.data)) {
-      // 이쪽도 보통 원화 환산이 직접 없을 수 있다. 여기서는 코인/수량만 보관.
-      coinsFromDefi = defi.json.data.map(x => ({
-        ccy: x.ccy || x.earnCcy || "UNKNOWN",
-        amt: Number(x.investedAmt ?? x.subsAmt ?? 0)
-      }));
-    }
-
-    // 6) 합산 로직
-    // - tradingUSD: account/balance의 totalEq 사용 (이미 USD 등가)
-    // - fundingUSD: asset/balances의 eqUsd 합
-    // - savings/defi는 USD환산 필드가 없으면 0으로 두고, 추후 오라클로 확장 가능
-    const subtotalUSD = (Number(tradingUSD) || 0) + (Number(fundingUSD) || 0) + (Number(savingsUSD) || 0) + (Number(defiUSD) || 0);
-
-    // 상위 코인 브레이크다운: account(details) + funding(eqUsd 있는 곳)만으로 상위 5개
-    const merged = [];
-    for (const it of coinsFromAccount) if (it.usd) merged.push({ ccy: it.ccy, usd: it.usd });
-    for (const it of coinsFromFunding) if (it.usd) merged.push({ ccy: it.ccy, usd: it.usd });
-
-    // 같은 코인 합치기
-    const byCcy = {};
-    for (const it of merged) {
-      byCcy[it.ccy] = (byCcy[it.ccy] || 0) + (Number(it.usd) || 0);
-    }
-    const topCoinsUSD = Object.entries(byCcy)
-      .map(([ccy, usd]) => ({ ccy, usd }))
+    // 상위 코인 브레이크다운(거래/자산 계정에서의 USD 평가)
+    const assetCoins = await fetchAssetBalances(auth);
+    const topCoinsUSD = assetCoins
+      .filter((x) => Number.isFinite(x.usd) && x.usd !== 0)
       .sort((a, b) => b.usd - a.usd)
       .slice(0, 5);
 
-    const out = {
-      mode,
+    // Earn - Savings/DeFi (USDT는 1:1로 USD에 합산)
+    const earnSavingsUSDT = await fetchSavingsUSDT(auth);
+    const earnDefiUSDT = await fetchDefiUSDT(auth);
+
+    const fundingUSD = 0; // (필요하면 /asset/balances?type=funding 등 추가 분해)
+    const earnSavingsUSD = earnSavingsUSDT; // 1 USDT = 1 USD
+    const earnDefiUSD = earnDefiUSDT;       // 1 USDT = 1 USD
+
+    const subtotalUSD = tradingUSD + fundingUSD + earnSavingsUSD + earnDefiUSD;
+
+    // 결과
+    res.status(200).json({
+      mode:
+        cfg.acctLv === "1"
+          ? "Simple / Single-Currency"
+          : cfg.acctLv === "5"
+          ? "Advanced / Multi-Currency"
+          : `acctLv=${cfg.acctLv || "?"}`,
       totals: {
         tradingUSD: Math.round(tradingUSD * 100) / 100,
         fundingUSD: Math.round(fundingUSD * 100) / 100,
-        earnSavingsUSD: Math.round(savingsUSD * 100) / 100,
-        earnDefiUSD: Math.round(defiUSD * 100) / 100,
-        subtotalUSD: Math.round(subtotalUSD * 100) / 100
+        earnSavingsUSD: Math.round(earnSavingsUSD * 100) / 100,
+        earnDefiUSD: Math.round(earnDefiUSD * 100) / 100,
+        subtotalUSD: Math.round(subtotalUSD * 100) / 100,
       },
-      // subtotalUSD가 사실상 '현재 알 수 있는 USD 합'임
       totalUSD: Math.round(subtotalUSD * 100) / 100,
       topCoinsUSD,
       timestamp: Date.now(),
-      note: "Savings/DeFi는 USD 환산 필드가 없어 0으로 집계됨(추후 가격 오라클 연결로 확장 가능)."
-    };
-
-    if (debugMode) out.debug = debug;
-    return res.status(200).json(out);
+      note:
+        "Earn(Savings/DeFi)의 USDT는 1:1로 USD로 집계. 비(非)USDT Earn은 가격 오라클 연동 시 확장 가능.",
+    });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
