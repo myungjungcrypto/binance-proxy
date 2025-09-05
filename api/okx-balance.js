@@ -1,98 +1,72 @@
 import crypto from "crypto";
 
-function sign({ timestamp, method, requestPath, body, secretKey }) {
-  const prehash = timestamp + method + requestPath + (body || "");
-  return crypto.createHmac("sha256", secretKey).update(prehash).digest("base64");
+const OKX_BASE = "https://www.okx.com";
+
+function isoTs() {
+  return new Date().toISOString();
 }
 
-async function okxFetch({ method = "GET", path, body = "", apiKey, secretKey, passphrase }) {
-  const timestamp = new Date().toISOString();
-  const signature = sign({ timestamp, method, requestPath: path, body, secretKey });
-
-  const resp = await fetch(`https://www.okx.com${path}`, {
-    method,
-    headers: {
-      "OK-ACCESS-KEY": apiKey,
-      "OK-ACCESS-SIGN": signature,
-      "OK-ACCESS-TIMESTAMP": timestamp,
-      "OK-ACCESS-PASSPHRASE": passphrase,
-      "Content-Type": "application/json",
-    },
-    ...(method !== "GET" ? { body } : {}),
-  });
-
-  const json = await resp.json();
-  if (json.code !== "0") {
-    throw new Error(`OKX API Error ${json.code}: ${json.msg || ""}`);
-  }
-  return json;
+function sign({ ts, method, path, query = "", body = "", secret }) {
+  const prehash = ts + method.toUpperCase() + path + (method.toUpperCase() === "GET" ? (query || "") : (body || ""));
+  return crypto.createHmac("sha256", secret).update(prehash).digest("base64");
 }
 
 export default async function handler(req, res) {
   try {
     const apiKey = process.env.OKX_API_KEY;
-    const secretKey = process.env.OKX_SECRET_KEY;
+    const secret = process.env.OKX_SECRET_KEY;
     const passphrase = process.env.OKX_PASSPHRASE;
-    if (!apiKey || !secretKey || !passphrase) {
+    if (!apiKey || !secret || !passphrase) {
       return res.status(500).json({ error: "Missing OKX API credentials" });
     }
 
-    // 1) 계정 잔액(UA, 멀티커런시) — totalEq(USD) 신뢰
-    const bal = await okxFetch({
-      method: "GET",
-      path: "/api/v5/account/balance",
-      apiKey, secretKey, passphrase,
+    // Advanced + Multi-currency → 통합계정(UNIFIED)로 운용됨
+    // 잔액: GET /api/v5/account/balance
+    const method = "GET";
+    const path = "/api/v5/account/balance";
+    const query = ""; // 특정 ccy 필터 없으면 전체
+    const ts = isoTs();
+    const sig = sign({ ts, method, path, query, secret });
+
+    const r = await fetch(`${OKX_BASE}${path}`, {
+      method,
+      headers: {
+        "OK-ACCESS-KEY": apiKey,
+        "OK-ACCESS-SIGN": sig,
+        "OK-ACCESS-TIMESTAMP": ts,
+        "OK-ACCESS-PASSPHRASE": passphrase
+      }
     });
 
-    const info = bal?.data?.[0];
-    if (!info) {
-      return res.status(500).json({ error: "No account data", raw: bal });
+    const text = await r.text();
+    let json;
+    try { json = JSON.parse(text); } catch { return res.status(502).json({ error: "Non-JSON from OKX", raw: text }); }
+
+    if (!r.ok || json.code !== "0") {
+      return res.status(502).json({ error: "OKX API Error", data: json });
     }
 
-    // totalEq: Unified Account에서 USD기준 총자산
-    const totalEqUSD = parseFloat(info.totalEq || "0");
+    const data = json?.data?.[0];
+    if (!data) return res.status(500).json({ error: "No account data", raw: json });
 
-    // 코인별 eqUsd가 있으면 브레이크다운 구성
-    const breakdown = Array.isArray(info.details)
-      ? info.details
-          .map(c => ({
-            coin: c.ccy,
-            eq: parseFloat(c.eq || "0"),
-            usd: parseFloat(c.eqUsd || "0"),
-          }))
-          .filter(x => (Number.isFinite(x.usd) && x.usd !== 0) || (Number.isFinite(x.eq) && x.eq !== 0))
-          .sort((a, b) => (b.usd || 0) - (a.usd || 0))
-      : [];
+    // totalEq: 계정 총 평가 (USD 단위로 제공)
+    const totalEq = Number(data.totalEq || "0");
+    // 상세 코인별
+    const details = Array.isArray(data.details) ? data.details : [];
+    // 상위 5개(USD 가치 큰 순)
+    const topCoins = details
+      .map(c => ({ ccy: c.ccy, usd: Number(c.eqUsd || "0") }))
+      .filter(x => x.usd && Number.isFinite(x.usd))
+      .sort((a, b) => b.usd - a.usd)
+      .slice(0, 5);
 
-    // 2) 자산 총평가(보강) — valuationCcy는 기본 USD
-    const valuationCcy = (req.query.valuationCcy || "USD").toUpperCase();
-    const val = await okxFetch({
-      method: "GET",
-      path: `/api/v5/asset/asset-valuation?ccy=${encodeURIComponent(valuationCcy)}`,
-      apiKey, secretKey, passphrase,
-    });
-    const totalVal = parseFloat(val?.data?.[0]?.totalVal || "0");
-
-    // 최종 totalUSD는 우선순위: totalEq -> asset-valuation
-    const totalUSD = Number.isFinite(totalEqUSD) && totalEqUSD > 0
-      ? totalEqUSD
-      : (valuationCcy === "USD" && Number.isFinite(totalVal) ? totalVal : 0);
-
-    res.status(200).json({
-      mode: "UA-Advanced-MultiCurrency",
-      totalUSD: Math.round(totalUSD * 100) / 100,
-      source: Number.isFinite(totalEqUSD) && totalEqUSD > 0 ? "account.balance.totalEq" : "asset.valuation",
-      valuationCcy,
-      topCoinsUSD: breakdown
-        .filter(x => Number.isFinite(x.usd) && x.usd > 0)
-        .slice(0, 5)
-        .map(({ coin, usd }) => ({ coin, usd: Math.round(usd * 100) / 100 })),
-      timestamp: Date.now(),
-      rawHints: {
-        hasEqUsdPerCoin: Array.isArray(info.details) && info.details.some(d => d.eqUsd !== undefined),
-      },
+    return res.status(200).json({
+      mode: "Advanced / Multi-Currency",
+      totalUSD: Math.round(totalEq * 100) / 100,
+      topCoinsUSD: topCoins,
+      timestamp: Date.now()
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: e.message });
   }
 }
