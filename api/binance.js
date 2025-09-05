@@ -10,23 +10,29 @@ export default async function handler(req, res) {
     }
 
     const timestamp = Date.now();
-    const query = `timestamp=${timestamp}`;
+    const recvWindow = 60000;
+    const query = `timestamp=${timestamp}&recvWindow=${recvWindow}`;
     const signature = crypto
       .createHmac("sha256", secretKey)
       .update(query)
       .digest("hex");
 
-    const url = `https://api.binance.com/api/v3/account?${query}&signature=${signature}`;
+    const url = `https://api.binance.com/sapi/v1/portfolio/account?${query}&signature=${signature}`;
 
     const response = await fetch(url, {
       method: "GET",
       headers: {
         "X-MBX-APIKEY": apiKey,
+        "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Vercel Server)"
       }
     });
 
     const data = await response.json();
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: data });
+    }
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.status(200).json(data);
