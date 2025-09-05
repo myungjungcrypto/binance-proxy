@@ -2,12 +2,13 @@
   "version": 2,
   "functions": {
     "api/**/*.js": {
-      "runtime": "nodejs22.x",
-      "memory": 256,
-      "maxDuration": 10
+      "runtime": "nodejs22.x"
     }
   },
-  "routes": [
-    { "src": "/api/(.*)", "dest": "/api/$1" }
+  "crons": [
+    {
+      "path": "/api/xpl-ticker",
+      "schedule": "* * * * *"
+    }
   ]
 }
