@@ -48,7 +48,7 @@ async function getBybitSummary() {
   const BASE = "https://api.bybit.com";
   const recvWindow = "5000";
   const timestamp = Date.now().toString();
-  const q = new URLSearchParams({ category: "linear" }).toString();
+  const q = new URLSearchParams({ category: "linear", settleCoin: "USDT" }).toString();
   const sig = bybitSign({ timestamp, apiKey, recvWindow, queryString: q, secretKey });
   const url = `${BASE}/v5/position/list?${q}`;
   const r = await fetchJSON(url, {
@@ -135,7 +135,7 @@ async function getBitgetSummary() {
   const ts = Date.now().toString();
   const method = "GET";
   const path = "/api/v2/mix/position/all-position";
-  const query = "productType=umcbl";
+  const query = "productType=umcblproductType=umcblmarginCoin=USDT";
   const sig = bitgetSign(ts, method, path, query, "", apiSecret);
 
   const r = await fetchJSON(`https://api.bitget.com${path}?${query}`, {
