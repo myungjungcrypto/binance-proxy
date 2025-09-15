@@ -135,7 +135,7 @@ async function getBitgetSummary() {
   const ts = Date.now().toString();
   const method = "GET";
   const path = "/api/v2/mix/position/all-position";
-  const query = "productType=umcblproductType=umcblmarginCoin=USDTproductType=umcblmarginCoin=USDT";
+  const query = new URLSearchParams({ productType: "UMCBL", marginCoin: "USDT" }).toString();
   const sig = bitgetSign(ts, method, path, query, "", apiSecret);
 
   const r = await fetchJSON(`https://api.bitget.com${path}?${query}`, {
