@@ -494,39 +494,108 @@ async function okxFutures() {
   };
 }
 
-// OKX 지갑(현물 등) ALT USD 요약(eqUsd 사용)
+// OKX Savings(Earn) 잔액을 USD로 환산하여 합계/상위 목록 반환
+// - 잔액: /api/v5/finance/savings/balance
+// - 가격: /api/v5/market/tickers?instType=SPOT (COIN-USDT 매칭)
+async function okxSavingsBalancesUSD() {
+  const key = process.env.OKX_API_KEY;
+  const secret = process.env.OKX_API_SECRET;
+  const passphrase = process.env.OKX_API_PASSPHRASE;
+  if (!key || !secret || !passphrase) throw new Error("OKX_KEYS");
+
+  // 1) Savings 잔액
+  const savings = await okxFetch({
+    endpoint: "/api/v5/finance/savings/balance",
+    key, secret, passphrase,
+  });
+  const items = Array.isArray(savings?.data) ? savings.data : [];
+
+  // 2) USDT 페어 스팟 가격
+  const tick = await fetchJSON(`${OKX_BASE}/api/v5/market/tickers?instType=SPOT`);
+  const price = new Map(); // "COIN" -> last price in USDT
+  if (tick.ok && Array.isArray(tick.json?.data)) {
+    for (const t of tick.json.data) {
+      const inst = String(t.instId || ""); // 예: "OKB-USDT"
+      const m = inst.match(/^([A-Z0-9]+)-USDT$/);
+      if (m) price.set(m[1], num(t.last));
+    }
+  }
+
+  let total = 0;
+  const top = [];
+
+  for (const it of items) {
+    const ccy = String(it.ccy || it.asset || it.currency || "");
+    if (!ccy || EXCLUDE_ASSETS.has(ccy)) continue;
+
+    // amt/amount/balance 필드 케이스 가드
+    const amt = num(it.amt || it.amount || it.balance || it.bal || it.availBal || it.available || it.total);
+    if (!amt) continue;
+
+    const px = price.get(ccy) || 0;
+    if (!px) continue;
+
+    const usd = amt * px;
+    if (usd >= 100) {
+      total += usd;
+      top.push({ asset: ccy, usd: +usd.toFixed(2) });
+    }
+  }
+
+  top.sort((a, b) => b.usd - a.usd);
+  return {
+    altSavingsUSD: +total.toFixed(2),
+    altSavingsTop: top.slice(0, 25),
+  };
+}
+
+// OKX 지갑(현물 eqUsd) + Savings(Earn) USD 합산
 async function okxWallet() {
   const key = process.env.OKX_API_KEY;
   const secret = process.env.OKX_API_SECRET;
   const passphrase = process.env.OKX_API_PASSPHRASE;
   if (!key || !secret || !passphrase) throw new Error("OKX_KEYS");
 
+  // 1) 현물/마진 등 계정 잔액: eqUsd 사용
   const bal = await okxFetch({
     endpoint: "/api/v5/account/balance",
     key, secret, passphrase,
   });
-
   const details = bal?.data?.[0]?.details || [];
 
-  let altWalletUSD = 0;
-  const altWalletTop = [];
-
+  let spotUSD = 0;
+  const spotTop = [];
   for (const d of details) {
     const asset = d.ccy || "";
     if (!asset || EXCLUDE_ASSETS.has(asset)) continue;
 
     const usd = num(d.eqUsd);
     if (usd >= 100) {
-      altWalletUSD += usd;
-      altWalletTop.push({ asset, usd: +usd.toFixed(2) });
+      spotUSD += usd;
+      spotTop.push({ asset, usd: +usd.toFixed(2) });
     }
   }
+  spotTop.sort((a, b) => b.usd - a.usd);
 
-  altWalletTop.sort((a, b) => b.usd - a.usd);
+  // 2) Savings(Earn) 잔액 환산
+  const savings = await okxSavingsBalancesUSD().catch(() => ({
+    altSavingsUSD: 0,
+    altSavingsTop: [],
+  }));
+
+  // 3) 합산 및 상위 25개
+  const totalUSD = spotUSD + num(savings.altSavingsUSD);
+  const combinedTop = [...spotTop, ...(savings.altSavingsTop || [])]
+    .sort((a, b) => b.usd - a.usd)
+    .slice(0, 25);
 
   return {
-    altWalletUSD: +altWalletUSD.toFixed(2),
-    altWalletTop: altWalletTop.slice(0, 25),
+    altWalletUSD: +totalUSD.toFixed(2),
+    altWalletTop: combinedTop,
+    components: {
+      spotUSD: +spotUSD.toFixed(2),
+      savingsUSD: +num(savings.altSavingsUSD).toFixed(2),
+    },
   };
 }
 
